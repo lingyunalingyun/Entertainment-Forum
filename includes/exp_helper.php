@@ -221,6 +221,99 @@ function is_blocked($conn, int $blocker_id, int $blocked_id): bool {
     return $r && $r->num_rows > 0;
 }
 
+// ─── 在线曲库（song_sheets）──────────────────────────────
+// 给 SkyMusic 桌面端拉取曲谱用，匿名可下载，登录可上传
+function ensure_song_sheets_table($conn): void {
+    $conn->query("CREATE TABLE IF NOT EXISTS song_sheets (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        uploader_id INT NOT NULL,
+        title VARCHAR(150) NOT NULL,
+        artist VARCHAR(100) DEFAULT NULL,
+        transcribed_by VARCHAR(100) DEFAULT NULL,
+        bpm INT DEFAULT NULL,
+        subdiv INT DEFAULT NULL,
+        difficulty TINYINT NOT NULL DEFAULT 3,
+        description VARCHAR(500) DEFAULT NULL,
+        tags VARCHAR(255) DEFAULT NULL,
+        file_path VARCHAR(255) NOT NULL,
+        original_filename VARCHAR(255) DEFAULT NULL,
+        file_size INT NOT NULL DEFAULT 0,
+        note_count INT NOT NULL DEFAULT 0,
+        downloads INT NOT NULL DEFAULT 0,
+        likes INT NOT NULL DEFAULT 0,
+        views INT NOT NULL DEFAULT 0,
+        status VARCHAR(20) NOT NULL DEFAULT 'published',
+        is_recommended TINYINT(1) NOT NULL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_uploader (uploader_id),
+        INDEX idx_status (status),
+        INDEX idx_created (created_at),
+        INDEX idx_downloads (downloads),
+        INDEX idx_likes (likes)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    $conn->query("CREATE TABLE IF NOT EXISTS sheet_likes (
+        sheet_id INT NOT NULL,
+        user_id INT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_sheet_user (sheet_id, user_id),
+        INDEX idx_user (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    // 文件目录
+    $dir = dirname(__DIR__) . '/uploads/sheets';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+}
+
+// 把任意编码的曲谱字节流转成 UTF-8 字符串（去 BOM）
+// 支持 UTF-8 / UTF-16 LE / UTF-16 BE，SkyStudio 老曲谱大量用 UTF-16 LE BOM
+function normalize_sheet_encoding(string $content): string {
+    if (strlen($content) >= 2) {
+        $b0 = $content[0]; $b1 = $content[1];
+        if ($b0 === "\xFF" && $b1 === "\xFE") {
+            $conv = @iconv('UTF-16LE', 'UTF-8//IGNORE', substr($content, 2));
+            if ($conv !== false) return $conv;
+        }
+        if ($b0 === "\xFE" && $b1 === "\xFF") {
+            $conv = @iconv('UTF-16BE', 'UTF-8//IGNORE', substr($content, 2));
+            if ($conv !== false) return $conv;
+        }
+    }
+    if (substr($content, 0, 3) === "\xEF\xBB\xBF") $content = substr($content, 3);
+    return $content;
+}
+
+// 解析 SkyStudio JSON 曲谱，提取元数据
+// 返回 ['ok'=>bool, 'msg'=>string, 'meta'=>['name','bpm','subdiv','author','transcribedBy','noteCount']]
+function parse_sky_sheet_json(string $content): array {
+    $content = normalize_sheet_encoding($content);
+    $data = json_decode($content, true);
+    if ($data === null) {
+        $err = function_exists('json_last_error_msg') ? json_last_error_msg() : 'json decode failed';
+        return ['ok' => false, 'msg' => 'JSON 解析失败：' . $err, 'meta' => []];
+    }
+    // 兼容 [{}] 数组包裹和 {} 单对象两种写法
+    if (is_array($data) && isset($data[0]) && is_array($data[0])) {
+        $song = $data[0];
+    } elseif (is_array($data) && isset($data['songNotes'])) {
+        $song = $data;
+    } else {
+        return ['ok' => false, 'msg' => '曲谱结构不合法（顶层应为数组或对象）', 'meta' => []];
+    }
+    if (empty($song['songNotes']) || !is_array($song['songNotes'])) {
+        return ['ok' => false, 'msg' => '曲谱缺少 songNotes 字段', 'meta' => []];
+    }
+    return ['ok' => true, 'msg' => '', 'meta' => [
+        'name'           => isset($song['name']) ? trim((string)$song['name']) : '',
+        'bpm'            => isset($song['bpm']) ? (int)$song['bpm'] : 0,
+        'subdiv'         => isset($song['subdiv']) ? (int)$song['subdiv'] : 0,
+        'author'         => isset($song['author']) ? trim((string)$song['author']) : '',
+        'transcribedBy'  => isset($song['transcribedBy']) ? trim((string)$song['transcribedBy']) : '',
+        'noteCount'      => count($song['songNotes']),
+    ]];
+}
+
 // ─── 内部：构建 HTML 邮件模板 ───────────────────────────
 function _build_email_html(string $title, string $greeting, string $body_html, string $btn_text, string $btn_link): string {
     $site = SITE_NAME;

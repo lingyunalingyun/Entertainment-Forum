@@ -18,7 +18,8 @@
 9. [转发与动态](#9-转发与动态)
 10. [交友页](#10-交友页)
 11. [客服系统](#11-客服系统)
-12. [配置说明](#12-配置说明)
+12. [在线曲库](#12-在线曲库云端曲谱)
+13. [配置说明](#13-配置说明)
 13. [开发工作流](#13-开发工作流)
 14. [常见维护操作](#14-常见维护操作)
 15. [部署注意事项](#15-部署注意事项)
@@ -57,6 +58,7 @@
 ├── dating.php                  交友页（滚动卡片墙，投放 / 查看交友卡片）
 ├── search.php                  全站搜索（帖子 + 用户 Tab）
 ├── topic.php                   话题页（#标签聚合帖子列表）
+├── sheets.php                  在线曲库主页（公开浏览/搜索/下载，给 SkyMusic 桌面端用）
 ├── style.css                   全站基础样式
 │
 ├── includes/
@@ -115,7 +117,14 @@
 │   ├── avatars/                用户头像
 │   ├── posts/                  帖子内图片
 │   ├── attachments/            帖子附件
-│   └── categories/             分区封面图
+│   ├── categories/             分区封面图
+│   └── sheets/                 在线曲库曲谱文件 (.txt / .json，≤5MB)
+│
+├── api/
+│   └── sheets/                 给 SkyMusic 桌面端的公开 JSON API
+│       ├── list.php            列表 + 搜索 + 筛选 + 分页
+│       ├── detail.php          单首元数据
+│       └── download.php        曲谱文件下载（透传到 actions）
 │
 └── 400.php / 401.php / 403.php / 404.php / 429.php / 500.php / 502.php / 503.php
                                 自定义错误页（暗色终端风格）
@@ -668,7 +677,91 @@ publish.php 填写 → AJAX POST save.php
 
 ---
 
-## 12. 配置说明
+## 12. 在线曲库（云端曲谱）
+
+为 SkyMusic 桌面端（光遇自动弹琴助手）提供共享曲谱的云端存储与分发。匿名可下载，登录可上传。完全独立于帖子/分区系统。
+
+### 核心文件
+
+| 文件 | 说明 |
+|------|------|
+| `sheets.php` | 曲库主页（公开浏览，搜索/排序/难度筛选/分页） |
+| `pages/sheet_detail.php` | 详情页（元数据 + 下载 + 点赞 + 删除） |
+| `pages/sheet_upload.php` | 上传页（登录+未封禁，前端 JS 自动解析 JSON 填表） |
+| `pages/admin_sheets.php` | 管理后台（精选切换 / 下架 / 恢复 / 硬删） |
+| `actions/sheet_upload.php` | 接收上传，解析元数据写库写文件 |
+| `actions/sheet_download.php` | 公开匿名下载，downloads++ 后流式返回 |
+| `actions/sheet_like.php` | 点赞 toggle |
+| `actions/sheet_delete.php` | 自删 / 管理员强删（同时 unlink 文件） |
+| `api/sheets/list.php` | 公开 JSON API：列表 + 搜索 + 筛选 + 分页 |
+| `api/sheets/detail.php` | 公开 JSON API：单首元数据 |
+| `api/sheets/download.php` | 公开 API：直接返回曲谱文件（透传到 actions） |
+
+### 数据表
+
+#### song_sheets — 曲谱主表
+
+```sql
+CREATE TABLE song_sheets (
+  id                INT          AUTO_INCREMENT PRIMARY KEY,
+  uploader_id       INT          NOT NULL,
+  title             VARCHAR(150) NOT NULL,
+  artist            VARCHAR(100) DEFAULT NULL,                  -- 原唱 / 作曲
+  transcribed_by    VARCHAR(100) DEFAULT NULL,                  -- 创谱人
+  bpm               INT          DEFAULT NULL,
+  subdiv            INT          DEFAULT NULL,                  -- 每拍细分（1/N）
+  difficulty        TINYINT      NOT NULL DEFAULT 3,            -- 1-5 星
+  description       VARCHAR(500) DEFAULT NULL,
+  tags              VARCHAR(255) DEFAULT NULL,                  -- 逗号分隔
+  file_path         VARCHAR(255) NOT NULL,                      -- uploads/sheets/xxx.txt
+  original_filename VARCHAR(255) DEFAULT NULL,
+  file_size         INT          NOT NULL DEFAULT 0,
+  note_count        INT          NOT NULL DEFAULT 0,
+  downloads         INT          NOT NULL DEFAULT 0,
+  likes             INT          NOT NULL DEFAULT 0,
+  views             INT          NOT NULL DEFAULT 0,
+  status            VARCHAR(20)  NOT NULL DEFAULT 'published',  -- published|rejected
+  is_recommended    TINYINT(1)   NOT NULL DEFAULT 0,
+  created_at        DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_uploader  (uploader_id),
+  INDEX idx_status    (status),
+  INDEX idx_created   (created_at),
+  INDEX idx_downloads (downloads),
+  INDEX idx_likes     (likes)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+#### sheet_likes — 点赞关系表
+
+```sql
+CREATE TABLE sheet_likes (
+  sheet_id   INT      NOT NULL,
+  user_id    INT      NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_sheet_user (sheet_id, user_id),
+  INDEX idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+> 表由 `ensure_song_sheets_table($conn)` 自动创建（在 `includes/exp_helper.php`）。曲谱文件存放路径 `uploads/sheets/`，目录由首次调用时 mkdir。
+
+### 关键约束
+
+- **文件类型**：白名单 `.txt` / `.json`
+- **大小上限**：5MB
+- **删除策略**：硬删（DB 删行 + `unlink($file_path)`，连带 `sheet_likes`）
+- **编码兼容**：`normalize_sheet_encoding()` 处理 UTF-16 LE/BE BOM 和 UTF-8 BOM；落盘统一为 UTF-8
+- **匿名下载**：`actions/sheet_download.php` 不需要 session
+- **审核策略**：默认 `status='published'` 后审制（复用举报系统）
+
+### 客户端集成
+
+SkyMusic 桌面端（[Sky-Automatic-Piano-Assistant](https://github.com/lingyunalingyun/Sky-Automatic-Piano-Assistant)）有 `CloudSheetsWindow.java`，调本站 `api/sheets/list.php` + `actions/sheet_download.php` 实现「☁ 在线曲库」功能。
+
+---
+
+## 13. 配置说明
 
 ### config.php 常量
 
@@ -690,7 +783,7 @@ uploads/categories/
 
 ---
 
-## 13. 开发工作流
+## 14. 开发工作流
 
 ```
 1. 在 论坛开发_本地版 修改并本地测试
@@ -710,7 +803,7 @@ uploads/categories/
 
 ---
 
-## 14. 常见维护操作
+## 15. 常见维护操作
 
 ### 设置角色
 
@@ -773,7 +866,7 @@ define('EMAIL_VERIFY_REQUIRED', true);
 
 ---
 
-## 15. 部署注意事项
+## 16. 部署注意事项
 
 1. **PHP 版本**：服务器为 PHP 7.x，禁用 `match()` 表达式，代码已用数组映射替代。
 

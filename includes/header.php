@@ -429,6 +429,7 @@ window.addEventListener('load', function() {
 
         <a href="<?= $base ?>categories.php" class="nav-item">分区</a>
         <a href="<?= $base ?>square.php" class="nav-item">广场</a>
+        <a href="<?= $base ?>sheets.php" class="nav-item">☁ 曲库</a>
         <?php if ($is_logged_in): ?>
         <a href="<?= $base ?>pages/moments.php" class="nav-item">动态</a>
         <?php endif; ?>
@@ -456,6 +457,9 @@ window.addEventListener('load', function() {
         <?php endif; ?>
         <?php if (in_array($current_role, ['admin', 'owner']) || !empty($_SESSION['is_cs'])): ?>
         <a href="<?= $base ?>pages/cs_panel.php" class="admin-drawer-btn" style="text-decoration:none;">💬 客服</a>
+        <?php endif; ?>
+        <?php if (in_array($current_role, ['admin', 'owner'])): ?>
+        <a href="<?= $base ?>pages/admin_sheets.php" class="admin-drawer-btn" style="text-decoration:none;">♪ 曲库</a>
         <?php endif; ?>
         <?php endif; ?>
 

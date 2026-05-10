@@ -1,6 +1,6 @@
 # 缪斯 MUSE 论坛 — 维护手册
 
-> 最后更新：2026-04-20
+> 最后更新：2026-05-10
 > GitHub：https://github.com/lingyunalingyun/Muse-Forum
 
 ---
@@ -18,8 +18,7 @@
 9. [转发与动态](#9-转发与动态)
 10. [交友页](#10-交友页)
 11. [客服系统](#11-客服系统)
-12. [在线曲库](#12-在线曲库云端曲谱)
-13. [配置说明](#13-配置说明)
+12. [配置说明](#12-配置说明)
 13. [开发工作流](#13-开发工作流)
 14. [常见维护操作](#14-常见维护操作)
 15. [部署注意事项](#15-部署注意事项)
@@ -58,14 +57,14 @@
 ├── dating.php                  交友页（滚动卡片墙，投放 / 查看交友卡片）
 ├── search.php                  全站搜索（帖子 + 用户 Tab）
 ├── topic.php                   话题页（#标签聚合帖子列表）
-├── sheets.php                  在线曲库主页（公开浏览/搜索/下载，给 SkyMusic 桌面端用）
 ├── style.css                   全站基础样式
 │
 ├── includes/
 │   ├── header.php              全局导航栏（粘性顶栏 + 封禁检测 + 封禁横幅）
 │   ├── exp_helper.php          核心辅助函数库（经验 / 等级 / 角色 / 邮件 / DB 迁移 / 可见性）
 │   ├── repost_card.php         转发卡片渲染函数 render_repost_card()
-│   └── text_format.php         文本格式化（#话题 @提及 渲染）
+│   ├── text_format.php         文本格式化（#话题 @提及 渲染）
+│   └── site_settings.php       通用站点配置 K/V 读写（AI key、第三方接口地址等动态配置）
 │
 ├── pages/
 │   ├── login.php               登录页
@@ -89,7 +88,8 @@
 │   ├── admin_messages.php      私信查询后台
 │   ├── admin_reports.php       举报管理后台（删帖 / 封号 / 驳回 / 处理）
 │   ├── cs_chat.php             客服聊天页（用户端）
-│   └── cs_panel.php            客服工作台（客服 / 管理端）
+│   ├── cs_panel.php            客服工作台（客服 / 管理端）
+│   └── ow_analyzer.php         守望先锋战绩分析（owjob 国服 + OverFast 国际服 → DeepSeek 教练分析）
 │
 ├── actions/                    AJAX / 表单处理端点（均接收 POST）
 │   ├── auth.php                认证（注册 / 登录 / 找回密码 / 重置密码 / 重发验证）
@@ -117,14 +117,7 @@
 │   ├── avatars/                用户头像
 │   ├── posts/                  帖子内图片
 │   ├── attachments/            帖子附件
-│   ├── categories/             分区封面图
-│   └── sheets/                 在线曲库曲谱文件 (.txt / .json，≤5MB)
-│
-├── api/
-│   └── sheets/                 给 SkyMusic 桌面端的公开 JSON API
-│       ├── list.php            列表 + 搜索 + 筛选 + 分页
-│       ├── detail.php          单首元数据
-│       └── download.php        曲谱文件下载（透传到 actions）
+│   └── categories/             分区封面图
 │
 └── 400.php / 401.php / 403.php / 404.php / 429.php / 500.php / 502.php / 503.php
                                 自定义错误页（暗色终端风格）
@@ -483,6 +476,40 @@ CREATE TABLE IF NOT EXISTS `cs_messages` (
 
 ---
 
+#### site_settings — 通用站点配置 K/V
+
+```sql
+CREATE TABLE `site_settings` (
+  `skey`       VARCHAR(100) NOT NULL PRIMARY KEY,    -- 配置键名（避开 SQL 保留字 key）
+  `svalue`     MEDIUMTEXT   DEFAULT NULL,
+  `updated_at` DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> 由 `includes/site_settings.php` 的 `ensure_site_settings_table()` 自动建。当前用到的 key：`deepseek_api_key` / `deepseek_base_url` / `deepseek_model`。
+
+#### ow_queries — 守望战绩查询 / 缓存表
+
+```sql
+CREATE TABLE `ow_queries` (
+  `id`              INT          AUTO_INCREMENT PRIMARY KEY,
+  `user_id`         INT          NOT NULL,
+  `battletag`       VARCHAR(100) NOT NULL,
+  `region`          VARCHAR(8)   NOT NULL DEFAULT 'cn',         -- 'cn' = 国服(owjob) / 'intl' = 国际服(OverFast)
+  `owjob_data`      MEDIUMTEXT   DEFAULT NULL,                  -- 数据源原始 JSON（字段虽叫 owjob 但 intl 也复用此列存 OverFast JSON）
+  `deepseek_advice` MEDIUMTEXT   DEFAULT NULL,
+  `created_at`      DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_user`             (`user_id`, `created_at`),
+  INDEX `idx_tag_region_time`  (`battletag`, `region`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> 由 `pages/ow_analyzer.php` 的 `ensure_ow_queries_table()` 自动建；旧表会自动 ALTER 补 region 列。
+> **缓存策略**：按 `(battletag, region)` 跨用户共享，6 小时内秒开。
+> **历史**：每次成功查询 INSERT 一行；当前用户最近 8 条作为历史条展示，可点击复用 (`?hid=X`)。
+
+---
+
 ### 3.3 自动补全机制
 
 项目使用 `ensure_user_columns($conn)`（在 `includes/exp_helper.php`）在每次请求时检查并补全缺失字段，因此**不需要手动 ALTER TABLE**。首次部署只需建好基础表，访问任意页面即可触发自动补全。
@@ -491,8 +518,9 @@ CREATE TABLE IF NOT EXISTS `cs_messages` (
 - **users 表**：补全 18 个新字段（见 §3.2 users 表字段说明）
 - **posts 表**：补全 `views`、`repost_id` 列
 - **messages 表**：补全 `ref_post_id` 列
-- **自动建表**：`user_blocks`、`post_view_logs`、`reports`
+- **自动建表**：`user_blocks`、`post_view_logs`、`reports`、`site_settings`、`ow_queries`
 - **cs 表**由 `pages/cs_chat.php` 首次访问时创建
+- **ow_queries 表**首次访问 `pages/ow_analyzer.php` 时创建，旧表自动 `ALTER ADD COLUMN region`
 
 ---
 
@@ -545,6 +573,27 @@ publish.php 填写 → AJAX POST save.php
 | `private` | 仅自己可见 |
 
 > admin / owner 绕过所有可见性限制。检查函数 `can_see_posts()` 在 `includes/exp_helper.php`。
+
+---
+
+### 守望战绩分析（pages/ow_analyzer.php）
+
+| 维度 | 说明 |
+|---|---|
+| 入口 | 顶部导航 `⌖ 守望战绩`，登录后可用 |
+| 数据源 | **国服** → `owjob.online` 三步代理（`/api/precheck` → 轮询 `/api/job` → `/api/result`，超时 90s）<br>**国际服** → `overfast-api.tekrop.fr`（`/players/{tag}/summary` + `/stats/summary`） |
+| AI 分析 | DeepSeek `chat/completions`，国服/国际服各有专属 prompt（严师人设：允许犀利但每条批评必须配"下一步怎么改"） |
+| 缓存 | `ow_queries` 表，按 `(battletag, region)` 跨用户共享，TTL 6 小时；同用户 1h 内重复查同 tag 不重复落历史 |
+| 历史对比 | 调 DeepSeek 前抓本 (battletag, region) 最近 3 次快照一并送入，AI 在【核心画像】顶端追加「最近变化」段（带数字对比） |
+| 国服专属 UI | 综合评分徽章（>=60 绿 / >=45 橙 / <45 红）、最佳角色演绎徽章（评分最高且场次≥3）、6 维雷达图（本职/压制/稳定/生存/人味/不挖坑）、量化指标卡片（每项配人话解释）、战队推荐（8 个 OWL 队，按雷达加权匹配） |
+| 国际服 UI | 各角色段位（tank/damage/support/open）、对局 KPI（场次/胜率/KDA/总时长）、按时长排序的英雄表 |
+| 强制刷新 | 缓存命中时显示「⏱ 数据来自 X 分钟前的缓存 [强制重新查询]」，链接带 `&refresh=1` 绕过缓存 |
+| 配置入口 | 后台 → 系统设置 → AI 配置（owner-only），DeepSeek `Base URL` / `Model` / `API Key` 三项 |
+
+**关键风险（部署前要清楚）：**
+1. owjob 不是公开 API，对方可能改路径/封 IP/突然下线 → 长期需要低强度运维盯着
+2. OverFast 在欧洲，国内服务器调用经常慢/超时（25–30s curl 超时保护）
+3. 国服账号体系跟国际服分离，同一个 BattleTag 在两服可能有完全不同战绩，缓存键已按 `(battletag, region)` 分别存储
 
 ---
 
@@ -677,91 +726,7 @@ publish.php 填写 → AJAX POST save.php
 
 ---
 
-## 12. 在线曲库（云端曲谱）
-
-为 SkyMusic 桌面端（光遇自动弹琴助手）提供共享曲谱的云端存储与分发。匿名可下载，登录可上传。完全独立于帖子/分区系统。
-
-### 核心文件
-
-| 文件 | 说明 |
-|------|------|
-| `sheets.php` | 曲库主页（公开浏览，搜索/排序/难度筛选/分页） |
-| `pages/sheet_detail.php` | 详情页（元数据 + 下载 + 点赞 + 删除） |
-| `pages/sheet_upload.php` | 上传页（登录+未封禁，前端 JS 自动解析 JSON 填表） |
-| `pages/admin_sheets.php` | 管理后台（精选切换 / 下架 / 恢复 / 硬删） |
-| `actions/sheet_upload.php` | 接收上传，解析元数据写库写文件 |
-| `actions/sheet_download.php` | 公开匿名下载，downloads++ 后流式返回 |
-| `actions/sheet_like.php` | 点赞 toggle |
-| `actions/sheet_delete.php` | 自删 / 管理员强删（同时 unlink 文件） |
-| `api/sheets/list.php` | 公开 JSON API：列表 + 搜索 + 筛选 + 分页 |
-| `api/sheets/detail.php` | 公开 JSON API：单首元数据 |
-| `api/sheets/download.php` | 公开 API：直接返回曲谱文件（透传到 actions） |
-
-### 数据表
-
-#### song_sheets — 曲谱主表
-
-```sql
-CREATE TABLE song_sheets (
-  id                INT          AUTO_INCREMENT PRIMARY KEY,
-  uploader_id       INT          NOT NULL,
-  title             VARCHAR(150) NOT NULL,
-  artist            VARCHAR(100) DEFAULT NULL,                  -- 原唱 / 作曲
-  transcribed_by    VARCHAR(100) DEFAULT NULL,                  -- 创谱人
-  bpm               INT          DEFAULT NULL,
-  subdiv            INT          DEFAULT NULL,                  -- 每拍细分（1/N）
-  difficulty        TINYINT      NOT NULL DEFAULT 3,            -- 1-5 星
-  description       VARCHAR(500) DEFAULT NULL,
-  tags              VARCHAR(255) DEFAULT NULL,                  -- 逗号分隔
-  file_path         VARCHAR(255) NOT NULL,                      -- uploads/sheets/xxx.txt
-  original_filename VARCHAR(255) DEFAULT NULL,
-  file_size         INT          NOT NULL DEFAULT 0,
-  note_count        INT          NOT NULL DEFAULT 0,
-  downloads         INT          NOT NULL DEFAULT 0,
-  likes             INT          NOT NULL DEFAULT 0,
-  views             INT          NOT NULL DEFAULT 0,
-  status            VARCHAR(20)  NOT NULL DEFAULT 'published',  -- published|rejected
-  is_recommended    TINYINT(1)   NOT NULL DEFAULT 0,
-  created_at        DATETIME     DEFAULT CURRENT_TIMESTAMP,
-  updated_at        DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_uploader  (uploader_id),
-  INDEX idx_status    (status),
-  INDEX idx_created   (created_at),
-  INDEX idx_downloads (downloads),
-  INDEX idx_likes     (likes)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-```
-
-#### sheet_likes — 点赞关系表
-
-```sql
-CREATE TABLE sheet_likes (
-  sheet_id   INT      NOT NULL,
-  user_id    INT      NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_sheet_user (sheet_id, user_id),
-  INDEX idx_user (user_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-```
-
-> 表由 `ensure_song_sheets_table($conn)` 自动创建（在 `includes/exp_helper.php`）。曲谱文件存放路径 `uploads/sheets/`，目录由首次调用时 mkdir。
-
-### 关键约束
-
-- **文件类型**：白名单 `.txt` / `.json`
-- **大小上限**：5MB
-- **删除策略**：硬删（DB 删行 + `unlink($file_path)`，连带 `sheet_likes`）
-- **编码兼容**：`normalize_sheet_encoding()` 处理 UTF-16 LE/BE BOM 和 UTF-8 BOM；落盘统一为 UTF-8
-- **匿名下载**：`actions/sheet_download.php` 不需要 session
-- **审核策略**：默认 `status='published'` 后审制（复用举报系统）
-
-### 客户端集成
-
-SkyMusic 桌面端（[Sky-Automatic-Piano-Assistant](https://github.com/lingyunalingyun/Sky-Automatic-Piano-Assistant)）有 `CloudSheetsWindow.java`，调本站 `api/sheets/list.php` + `actions/sheet_download.php` 实现「☁ 在线曲库」功能。
-
----
-
-## 13. 配置说明
+## 12. 配置说明
 
 ### config.php 常量
 
@@ -771,6 +736,18 @@ SkyMusic 桌面端（[Sky-Automatic-Piano-Assistant](https://github.com/lingyuna
 | `SITE_NAME` | 站点名称，显示在邮件头和页面标题 |
 | `MAIL_FROM` | 发件人邮箱，需 PHP `mail()` 可用 |
 | `EMAIL_VERIFY_REQUIRED` | `true` = 注册需验证邮箱；`false` = 直接激活（当前 false） |
+
+### AI 配置（后台 → 系统设置 → AI 配置，owner-only）
+
+存储在 `site_settings` 表，由 owner 在后台动态修改（不写死在 config.php）：
+
+| 配置 key | 默认值 | 用途 |
+|---|---|---|
+| `deepseek_base_url` | `https://api.deepseek.com` | DeepSeek API Base URL，可换私有部署/聚合代理 |
+| `deepseek_model`    | `deepseek-chat`             | 模型名 |
+| `deepseek_api_key`  | （空）                      | API Key，密码输入框，已存在的会打码显示，留空提交不会覆盖现有 |
+
+> 当前用于 `pages/ow_analyzer.php` 守望战绩教练分析。后续 AI 功能（搜索增强等）可复用同一份 key，无需改表结构。
 
 ### 上传目录权限
 
@@ -783,7 +760,7 @@ uploads/categories/
 
 ---
 
-## 14. 开发工作流
+## 13. 开发工作流
 
 ```
 1. 在 论坛开发_本地版 修改并本地测试
@@ -803,7 +780,7 @@ uploads/categories/
 
 ---
 
-## 15. 常见维护操作
+## 14. 常见维护操作
 
 ### 设置角色
 
@@ -866,7 +843,7 @@ define('EMAIL_VERIFY_REQUIRED', true);
 
 ---
 
-## 16. 部署注意事项
+## 15. 部署注意事项
 
 1. **PHP 版本**：服务器为 PHP 7.x，禁用 `match()` 表达式，代码已用数组映射替代。
 

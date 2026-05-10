@@ -9,6 +9,13 @@ $is_logged_in = isset($_SESSION['user_id']);
 $in_subdir = (strpos($_SERVER['PHP_SELF'], '/pages/') !== false);
 $base = $in_subdir ? '../' : '';
 
+// 加载当前用户装备的装饰（若已登录且 helper 可用）
+$header_user_deco = null;
+if ($is_logged_in && isset($conn) && function_exists('load_user_decoration')) {
+    @ensure_decoration_tables($conn);
+    $header_user_deco = load_user_decoration($conn, intval($_SESSION['user_id']));
+}
+
 // 未读消息数（只在有数据库连接时查询）
 $unread_count = 0;
 $pending_posts = 0;
@@ -71,6 +78,53 @@ if ($is_logged_in && isset($conn)) {
     }
 })();
 </script>
+
+<!-- ══ 全站留白覆盖：让两侧留白减少约 70% ══ -->
+<style>
+/* 主要容器统一宽到 ~1700px，左右内边距收紧到 10px */
+.page-layout,
+.container,
+.wrap,
+.page-wrap,
+.ap-shell,
+.ap-layout,
+.pub-layout,
+.panel-wrap,
+.msg-layout,
+.notif-wrap,
+.profile-container,
+.sd-wrap,
+.notice-page,
+.search-wrap,
+.act-wrap,
+.sh-hero-inner,
+.lib-wrap,
+.lib-grid,
+.cat-hero-inner,
+.sh-grid,
+.notif-list,
+.pub-form,
+.sh-filter-bar {
+    max-width: 1700px !important;
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+}
+/* sheets.php 等使用内联 max-width 的容器 */
+[style*="max-width:1200px"],
+[style*="max-width: 1200px"],
+[style*="max-width:1100px"],
+[style*="max-width: 1100px"],
+[style*="max-width:1000px"],
+[style*="max-width: 1000px"],
+[style*="max-width:960px"],
+[style*="max-width: 960px"],
+[style*="max-width:900px"],
+[style*="max-width: 900px"] {
+    max-width: 1700px !important;
+}
+/* admin.php 自身的 layout 不改（已经是 1700） */
+.ap-layout { padding-left: 0 !important; padding-right: 0 !important; }
+</style>
 
 <?php if (empty($skip_loader)): ?>
 <!-- ── 加载动画 ── -->
@@ -429,38 +483,25 @@ window.addEventListener('load', function() {
 
         <a href="<?= $base ?>categories.php" class="nav-item">分区</a>
         <a href="<?= $base ?>square.php" class="nav-item">广场</a>
-        <a href="<?= $base ?>sheets.php" class="nav-item">☁ 曲库</a>
+        <a href="<?= $base ?>sheets.php" class="nav-item">☁ 光遇曲库</a>
         <?php if ($is_logged_in): ?>
         <a href="<?= $base ?>pages/moments.php" class="nav-item">动态</a>
         <?php endif; ?>
         <a href="<?= $base ?>dating.php" class="nav-item">交友</a>
+        <a href="<?= $base ?>pages/ow_analyzer.php" class="nav-item">⌖ 守望战绩</a>
         <div class="nav-divider"></div>
 
         <?php
         $has_admin = in_array($current_role, ['admin', 'owner', 'reviewer']) || !empty($_SESSION['is_cs']);
         if ($has_admin): ?>
-        <?php if (in_array($current_role, ['admin', 'owner', 'reviewer'])): ?>
         <a href="<?= $base ?>pages/admin.php" class="admin-drawer-btn" style="text-decoration:none;">
             ⚙ 后台
-            <?php $pending_total = $pending_posts + $pending_reports; if ($pending_total > 0): ?>
+            <?php
+            $pending_total = ($pending_posts ?? 0) + ($pending_reports ?? 0) + ($pending_profile_reviews ?? 0);
+            if ($pending_total > 0): ?>
             <span style="background:#f85149;color:#fff;border-radius:9px;min-width:16px;height:16px;font-size:10px;display:inline-flex;align-items:center;justify-content:center;padding:0 3px;font-weight:700;"><?= $pending_total > 99 ? '99+' : $pending_total ?></span>
             <?php endif; ?>
         </a>
-        <?php endif; ?>
-        <?php if (in_array($current_role, ['admin', 'owner'])): ?>
-        <a href="<?= $base ?>pages/admin_profile_reviews.php" class="admin-drawer-btn" style="text-decoration:none;">
-            👤 资料审核
-            <?php if (!empty($pending_profile_reviews) && $pending_profile_reviews > 0): ?>
-            <span style="background:#f85149;color:#fff;border-radius:9px;min-width:16px;height:16px;font-size:10px;display:inline-flex;align-items:center;justify-content:center;padding:0 3px;font-weight:700;"><?= $pending_profile_reviews > 99 ? '99+' : $pending_profile_reviews ?></span>
-            <?php endif; ?>
-        </a>
-        <?php endif; ?>
-        <?php if (in_array($current_role, ['admin', 'owner']) || !empty($_SESSION['is_cs'])): ?>
-        <a href="<?= $base ?>pages/cs_panel.php" class="admin-drawer-btn" style="text-decoration:none;">💬 客服</a>
-        <?php endif; ?>
-        <?php if (in_array($current_role, ['admin', 'owner'])): ?>
-        <a href="<?= $base ?>pages/admin_sheets.php" class="admin-drawer-btn" style="text-decoration:none;">♪ 曲库</a>
-        <?php endif; ?>
         <?php endif; ?>
 
         <div class="nav-divider"></div>
@@ -473,12 +514,20 @@ window.addEventListener('load', function() {
                     <span class="notif-badge"><?= $unread_count > 99 ? '99+' : $unread_count ?></span>
                 <?php endif; ?>
             </a>
-            <a href="<?= $base ?>pages/profile.php" class="nav-item">
-                <img src="<?= $base ?>uploads/avatars/<?= htmlspecialchars($_SESSION['avatar'] ?? 'default.png') ?>"
-                     class="user-avatar-small"
-                     onerror="this.onerror=null;this.src='<?= $base ?>uploads/avatars/default.png'">
+            <a href="<?= $base ?>pages/profile.php" class="nav-item" style="position:relative;">
+                <span style="position:relative;display:inline-block;width:26px;height:26px;flex-shrink:0;vertical-align:middle;">
+                    <img src="<?= $base ?>uploads/avatars/<?= htmlspecialchars($_SESSION['avatar'] ?? 'default.png') ?>"
+                         class="user-avatar-small"
+                         style="width:100%;height:100%;display:block;"
+                         onerror="this.onerror=null;this.src='<?= $base ?>uploads/avatars/default.png'">
+                    <?php if (!empty($header_user_deco['frame']['image_path'])): ?>
+                    <img src="<?= $base ?><?= htmlspecialchars($header_user_deco['frame']['image_path']) ?>" alt=""
+                         style="position:absolute;top:-3px;left:-3px;width:32px;height:32px;pointer-events:none;">
+                    <?php endif; ?>
+                </span>
                 <span style="color:#e6edf3; font-size:13px;"><?= htmlspecialchars($_SESSION['username']) ?></span>
             </a>
+            <a href="<?= $base ?>pages/decorations.php" class="nav-item" title="我的装饰" style="font-size:12px;">装饰</a>
             <a href="<?= $base ?>pages/settings.php" class="nav-item" title="设置" style="font-size:12px;">设置</a>
             <a href="<?= $base ?>pages/logout.php" class="nav-item" style="font-size:12px;">退出</a>
         <?php else: ?>

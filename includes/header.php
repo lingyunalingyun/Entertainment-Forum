@@ -489,6 +489,7 @@ window.addEventListener('load', function() {
         <?php endif; ?>
         <a href="<?= $base ?>dating.php" class="nav-item">交友</a>
         <a href="<?= $base ?>pages/ow_analyzer.php" class="nav-item">⌖ 守望战绩</a>
+        <a href="<?= $base ?>pages/ark_bind.php" class="nav-item">⌖ 方舟分析</a>
         <div class="nav-divider"></div>
 
         <?php

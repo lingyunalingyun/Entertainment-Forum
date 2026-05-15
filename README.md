@@ -1,6 +1,6 @@
 # 缪斯 MUSE 论坛 — 维护手册
 
-> 最后更新：2026-05-10
+> 最后更新：2026-05-12
 > GitHub：https://github.com/lingyunalingyun/Muse-Forum
 
 ---
@@ -64,7 +64,13 @@
 │   ├── exp_helper.php          核心辅助函数库（经验 / 等级 / 角色 / 邮件 / DB 迁移 / 可见性）
 │   ├── repost_card.php         转发卡片渲染函数 render_repost_card()
 │   ├── text_format.php         文本格式化（#话题 @提及 渲染）
-│   └── site_settings.php       通用站点配置 K/V 读写（AI key、第三方接口地址等动态配置）
+│   ├── site_settings.php       通用站点配置 K/V 读写（AI key、第三方接口地址等动态配置）
+│   ├── hypergryph_api.php      鹰角通行证 API 封装（手机密码登录、basic info、OAuth grant、skland cred）
+│   ├── skland_api.php          森空岛 API 封装（HMAC+MD5 签名、binding、player_info）
+│   ├── ark_snapshot.php        明日方舟 player_info 870KB → 11KB 紧凑 snapshot 裁剪
+│   ├── ark_analyzer.php        DeepSeek 调用 + 明日方舟养成 prompt（含字段对照表 + 事实约束）
+│   ├── ark_pipeline.php        明日方舟业务管道（绑定流程、重新分析、六维图、肉鸽中文名、分享 HTML 渲染）
+│   └── ark_db.php              ark_credentials + ark_queries 表 + CRUD + 自动 prune 保留 5 条历史
 │
 ├── pages/
 │   ├── login.php               登录页
@@ -89,7 +95,9 @@
 │   ├── admin_reports.php       举报管理后台（删帖 / 封号 / 驳回 / 处理）
 │   ├── cs_chat.php             客服聊天页（用户端）
 │   ├── cs_panel.php            客服工作台（客服 / 管理端）
-│   └── ow_analyzer.php         守望先锋战绩分析（owjob 国服 + OverFast 国际服 → DeepSeek 教练分析）
+│   ├── ow_analyzer.php         守望先锋战绩分析（owjob 国服 + OverFast 国际服 → DeepSeek 教练分析）
+│   ├── ark_bind.php            明日方舟分析（鹰角通行证 → skland 数据 → DeepSeek 3 段养成分析 + 六维图 + 干员/肉鸽/进度）
+│   └── ark_share_generate.php  生成 share/{mid}_arknights.html 静态分享页（POST 端点）
 │
 ├── actions/                    AJAX / 表单处理端点（均接收 POST）
 │   ├── auth.php                认证（注册 / 登录 / 找回密码 / 重置密码 / 重发验证）
@@ -510,6 +518,51 @@ CREATE TABLE `ow_queries` (
 
 ---
 
+#### ark_credentials — 明日方舟绑定凭据表
+
+```sql
+CREATE TABLE `ark_credentials` (
+  `user_id`           INT          NOT NULL PRIMARY KEY,
+  `hg_token`          VARCHAR(64)  NOT NULL,                   -- 24 字符鹰角 SDK token（手机密码登录或 web-api/account/info/hg 拿到）
+  `skland_cred`       VARCHAR(255) DEFAULT '',                 -- 森空岛 cred（OAuth grant 换出）
+  `skland_sign_token` VARCHAR(255) DEFAULT '',                 -- 森空岛签名 token（与 cred 同时获取，长期有效）
+  `skland_did`        VARCHAR(64)  DEFAULT '',                 -- 设备 dId（用户首次绑定时生成，复用避免签名异常）
+  `game_uid`          VARCHAR(32)  DEFAULT '',                 -- 方舟玩家 UID
+  `nickname`          VARCHAR(64)  DEFAULT '',                 -- 玩家昵称
+  `channel_master_id` INT          DEFAULT 1,                  -- 1=官服 / 2=B服
+  `last_verified_at`  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  `created_at`        DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_uid` (`game_uid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> 由 `includes/ark_db.php` 的 `ensure_ark_credentials_table()` 自动建。一用户一行。
+> **不存密码**：路径 B 手机密码登录时，密码用完即扔，只存换出来的 24 字符 SDK token。
+
+---
+
+#### ark_queries — 明日方舟分析记录表
+
+```sql
+CREATE TABLE `ark_queries` (
+  `id`              INT         AUTO_INCREMENT PRIMARY KEY,
+  `user_id`         INT         NOT NULL,
+  `game_uid`        VARCHAR(32) NOT NULL,
+  `snapshot_data`   MEDIUMTEXT  DEFAULT NULL,    -- ark_build_snapshot() 输出的紧凑 JSON（~11KB）
+  `deepseek_advice` MEDIUMTEXT  DEFAULT NULL,    -- DeepSeek 返回的 3 段 markdown
+  `created_at`      DATETIME    DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_user`     (`user_id`, `created_at`),
+  INDEX `idx_uid_time` (`game_uid`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> 由 `includes/ark_db.php` 的 `ensure_ark_queries_table()` 自动建。
+> **缓存策略**：24 小时内（`ARK_CACHE_TTL_HOURS`）复用上次的 snapshot + advice，不再调 skland + DeepSeek。
+> **历史保留**：`ark_save_query()` 每次 INSERT 后自动 prune，每用户最多保留最新 5 条（`ARK_HISTORY_KEEP`）。
+> **解绑保留**：解绑只删 `ark_credentials`，`ark_queries` 历史完整保留，用户重绑后继续累积。
+
+---
+
 ### 3.3 自动补全机制
 
 项目使用 `ensure_user_columns($conn)`（在 `includes/exp_helper.php`）在每次请求时检查并补全缺失字段，因此**不需要手动 ALTER TABLE**。首次部署只需建好基础表，访问任意页面即可触发自动补全。
@@ -518,9 +571,10 @@ CREATE TABLE `ow_queries` (
 - **users 表**：补全 18 个新字段（见 §3.2 users 表字段说明）
 - **posts 表**：补全 `views`、`repost_id` 列
 - **messages 表**：补全 `ref_post_id` 列
-- **自动建表**：`user_blocks`、`post_view_logs`、`reports`、`site_settings`、`ow_queries`
+- **自动建表**：`user_blocks`、`post_view_logs`、`reports`、`site_settings`、`ow_queries`、`ark_credentials`、`ark_queries`
 - **cs 表**由 `pages/cs_chat.php` 首次访问时创建
 - **ow_queries 表**首次访问 `pages/ow_analyzer.php` 时创建，旧表自动 `ALTER ADD COLUMN region`
+- **ark_credentials / ark_queries 表**首次访问 `pages/ark_bind.php` 时创建
 
 ---
 
@@ -594,6 +648,37 @@ publish.php 填写 → AJAX POST save.php
 1. owjob 不是公开 API，对方可能改路径/封 IP/突然下线 → 长期需要低强度运维盯着
 2. OverFast 在欧洲，国内服务器调用经常慢/超时（25–30s curl 超时保护）
 3. 国服账号体系跟国际服分离，同一个 BattleTag 在两服可能有完全不同战绩，缓存键已按 `(battletag, region)` 分别存储
+
+---
+
+### 明日方舟分析（pages/ark_bind.php）
+
+| 维度 | 说明 |
+|---|---|
+| 入口 | 顶部导航 `⌖ 方舟分析`，登录后可用 |
+| 绑定方式 | **路径 C（推荐）**：用户在浏览器登录 `ak.hypergryph.com` → 访问 `https://web-api.hypergryph.com/account/info/hg` → 复制返回 JSON 的 `data.content` 字段（24 字符 SDK token）→ 粘贴到论坛表单。**不用密码不用书签**。<br>**路径 B（fallback）**：手机号 + 密码 → POST `as.hypergryph.com/user/auth/v1/token_by_phone_password` 换 SDK token。密码用完即扔不入库。 |
+| 数据通道 | 5 步 SDK token 流水线：①`/u8/user/info/v1/basic`(uid+nickname) → ③`/user/oauth2/v2/grant`(OAuth code) → ④`zonai.skland.com/user/auth/generate_cred_by_code`(cred+sign token) → ⑤`/game/player/binding`(角色列表) → ⑥`/game/player/info?uid=`(**870KB 完整数据**) |
+| snapshot 裁剪 | `ark_build_snapshot()` 把 870KB JSON → 11KB 紧凑结构（player/roster/building/progress 四块），喂给 DeepSeek |
+| AI 分析 | DeepSeek 3 段卡片：【队伍诊断】【资源规划】【高难玩法准备度】。prompt 含字段中文对照表 + 8 条事实约束（制造站只产作战记录/赤金/合成玉，不产合成玉碎片；集成战略 5 个赛季中文名映射；不用 IS1/IS2/rogue_X 缩写；语气铁律），温度 0.55 |
+| 缓存 | `ark_queries` 表，TTL 24h，同一用户同一时段不重新调 skland + DeepSeek。每用户保留最新 5 条历史 |
+| 凭据复用 | skland sign token 长期有效；重新分析时**不重跑 OAuth grant**，只用存的 cred/sign_token/did 调 ⑥ player_info，省时 |
+| 过期处理 | ⑥ 失败时（通常 7-30 天后授权过期）标记 `auth_expired`，UI 切到橙色"重新获取 SDK token"绑定表单，**历史记录保留**可点击查看 |
+| UI 视图 | 顶部 UID 显眼；KPI 行（博士等级/干员数/6 星精二/理智）；星级分布柱状图；六维雷达图（阵容深度/养成完成度/资源效率/集成战略/危机合约/活动通关）；进度网格（日周常/剿灭/危机合约/活动通关）；5 个集成战略赛季卡片（傀影/水月/银凇/萨卡兹/岁的界园志异）；6 星精二干员网格（18 个折叠可展开）；6 星未精二吃灰提醒；3 段 DeepSeek 分析卡片（绿/蓝/紫配色） |
+| 分享功能 | "↗ 生成分享页"按钮 → POST `pages/ark_share_generate.php` → 生成 `share/{mid}_arknights.html` 独立静态页（含全部内联 CSS）→ 模态显示 URL 复制 |
+| 集成战略赛季映射 | rogue_1=傀影与猩红孤钻 / rogue_2=水月与深蓝之树 / rogue_3=探索者的银凇止境 / rogue_4=萨卡兹的无终奇语 / rogue_5=岁的界园志异 |
+| 配置入口 | 复用守望战绩的 DeepSeek 配置（后台 → 系统设置 → AI 配置） |
+
+**关键技术坑（实现细节）：**
+1. 制造站 `formulaId` 是玩家本地配方索引，要去 `manufactureFormulaInfoMap[fid].itemId` 反查实际产物（2003=高级作战记录/3003=赤金/4001=合成玉）。**不能直接展示 formulaId 数字**。
+2. 贸易站没有 `speed` 字段（森空岛 API 不返回），要看 `strategy`（O_GOLD=龙门币/O_DIAMOND=合成玉碎片）。
+3. skland 签名：`MD5(HMAC-SHA256(token, path + query_or_body + ts + headers_json))`。dId 每用户固定（绑定时生成存表），避免每次重新生成导致服务端拒绝。
+4. **抽卡功能舍弃**：`/user/api/inquiry/gacha/history` 只认 `ak.hypergryph.com` 的 web cookie（`ak-user-center`），跟 SDK token 是平行体系。产品决策不做抽卡分析（如需可让用户手动导入第三方工具导出的 JSON）。
+5. DeepSeek prompt 必须强制中文，禁止直接复制 JSON 英文键名（sixStarUnfinished / stockCnt / bpLevel / avgBest 等）到输出文字，集成战略赛季必须用中文全名。
+
+**关键风险（部署前要清楚）：**
+1. 鹰角通行证 SDK 接口未公开，未来可能改路径或加 anti-bot，需要监控
+2. 路径 B 走密码登录，**线上必须先上 HTTPS**（musetreehouse.com 目前 HTTP，仅本地版可用）
+3. SDK token 与 skland 授权约 7-30 天过期，依赖 auth_expired 流程引导用户重新绑定
 
 ---
 
@@ -747,7 +832,7 @@ publish.php 填写 → AJAX POST save.php
 | `deepseek_model`    | `deepseek-chat`             | 模型名 |
 | `deepseek_api_key`  | （空）                      | API Key，密码输入框，已存在的会打码显示，留空提交不会覆盖现有 |
 
-> 当前用于 `pages/ow_analyzer.php` 守望战绩教练分析。后续 AI 功能（搜索增强等）可复用同一份 key，无需改表结构。
+> 当前用于 `pages/ow_analyzer.php` 守望战绩教练分析 + `pages/ark_bind.php` 明日方舟养成分析（两个功能共用同一份 DeepSeek key）。后续 AI 功能（搜索增强等）可继续复用，无需改表结构。
 
 ### 上传目录权限
 

@@ -9,6 +9,14 @@ $is_logged_in = isset($_SESSION['user_id']);
 $in_subdir = (strpos($_SERVER['PHP_SELF'], '/pages/') !== false);
 $base = $in_subdir ? '../' : '';
 
+// 左侧收缩侧边栏数据
+$sidebar = [];
+if (isset($conn)) {
+    require_once __DIR__ . '/sidebar_helper.php';
+    ensure_sidebar_tables($conn);
+    $sidebar = get_sidebar($conn);
+}
+
 // 加载当前用户装备的装饰（若已登录且 helper 可用）
 $header_user_deco = null;
 if ($is_logged_in && isset($conn) && function_exists('load_user_decoration')) {
@@ -462,10 +470,51 @@ window.addEventListener('load', function() {
     }
 </style>
 
+<!-- 左侧收缩侧边栏 -->
+<style>
+.sb-toggle{background:transparent;border:none;color:#8b949e;font-size:20px;cursor:pointer;padding:0 10px 0 4px;line-height:1;}
+.sb-toggle:hover{color:#3fb950;}
+.sb-navleft{display:flex;align-items:center;gap:6px;}
+body{transition:padding-left .25s ease;}
+body.sb-open{padding-left:260px;}
+#sb-mask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1500;}
+#sb-mask.open{display:block;}
+#sb-drawer{position:fixed;top:0;left:-300px;width:260px;height:100%;background:#0d1117;border-right:1px solid #30363d;z-index:1600;transition:left .25s ease;overflow-y:auto;padding:16px 0;}
+#sb-drawer.open{left:0;}
+.sb-head{padding:0 18px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #21262d;margin-bottom:10px;}
+.sb-head .t{font-size:14px;font-weight:700;color:#e6edf3;}
+.sb-head .x{background:none;border:none;color:#8b949e;font-size:18px;cursor:pointer;}
+.sb-group{margin-bottom:14px;}
+.sb-group-name{font-size:11px;color:#6e7681;font-family:'Courier New',monospace;letter-spacing:1px;text-transform:uppercase;padding:0 18px;margin-bottom:6px;}
+.sb-group-name::before{content:'// ';opacity:.6;}
+.sb-link{display:flex;align-items:center;gap:10px;padding:8px 18px;color:#c9d1d9;text-decoration:none;font-size:13px;transition:.12s;}
+.sb-link:hover{background:#161b22;color:#3fb950;}
+.sb-link .ic{width:18px;text-align:center;}
+</style>
+<div id="sb-mask" onclick="sbClose()"></div>
+<div id="sb-drawer">
+    <div class="sb-head"><span class="t">导航</span><button class="x" onclick="sbClose()">✕</button></div>
+    <?php foreach ($sidebar as $g): ?>
+    <div class="sb-group">
+        <div class="sb-group-name"><?= htmlspecialchars($g['name']) ?></div>
+        <?php foreach ($g['links'] as $l): ?>
+        <a class="sb-link" href="<?= $base . htmlspecialchars($l['url']) ?>"><span class="ic"><?= htmlspecialchars($l['icon']) ?></span><?= htmlspecialchars($l['label']) ?></a>
+        <?php endforeach; ?>
+    </div>
+    <?php endforeach; ?>
+</div>
+<script>
+function sbOpen(){ document.getElementById('sb-drawer').classList.add('open'); document.getElementById('sb-mask').classList.add('open'); document.body.classList.add('sb-open'); }
+function sbClose(){ document.getElementById('sb-drawer').classList.remove('open'); document.getElementById('sb-mask').classList.remove('open'); document.body.classList.remove('sb-open'); }
+</script>
+
 <nav class="main-navbar" style="position:relative;">
-    <a href="<?= $base ?>index.php" class="nav-logo">
-        <span class="nav-logo-icon"><img src="<?= $base ?>assets/logo.svg" alt="MUSE"></span> MUSE
-    </a>
+    <div class="sb-navleft">
+        <button class="sb-toggle" onclick="sbOpen()" aria-label="菜单" title="导航菜单">☰</button>
+        <a href="<?= $base ?>index.php" class="nav-logo">
+            <span class="nav-logo-icon"><img src="<?= $base ?>assets/logo.svg" alt="MUSE"></span> MUSE
+        </a>
+    </div>
 
     <!-- 移动端右侧按钮组 -->
     <div style="display:flex;align-items:center;gap:6px;">
@@ -488,6 +537,7 @@ window.addEventListener('load', function() {
         <a href="<?= $base ?>pages/moments.php" class="nav-item">动态</a>
         <?php endif; ?>
         <a href="<?= $base ?>dating.php" class="nav-item">交友</a>
+        <a href="<?= $base ?>bartender.php" class="nav-item">🍸 调酒</a>
         <a href="<?= $base ?>pages/ow_analyzer.php" class="nav-item">⌖ 守望战绩</a>
         <a href="<?= $base ?>pages/ark_bind.php" class="nav-item">⌖ 方舟分析</a>
         <div class="nav-divider"></div>

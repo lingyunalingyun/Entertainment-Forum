@@ -2,6 +2,11 @@
 session_start();
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/site_settings.php';
+require_once __DIR__ . '/../includes/ds163_ow_api.php';
+
+$skip_loader = true; // 战绩页禁用全站火焰加载动画（每次查询整页跳转太晃眼）
+
+const OW_CACHE_TTL_HOURS = 6;  // 战绩缓存有效期（小时）
 
 if (!isset($_SESSION['user_id'])) { header('Location: login.php'); exit; }
 
@@ -13,7 +18,7 @@ $region       = $_POST['region'] ?? $_GET['region'] ?? 'cn';
 if (!in_array($region, ['cn', 'intl'], true)) $region = 'cn';
 
 $error      = '';
-$data       = null;   // 国服=owjob result; 国际=overfast {summary, stats, ...}
+$data       = null;   // 国服=ds163 {profile,sport,leisure,card}; 国际=overfast {summary,stats}
 $advice     = '';
 $ds_error   = '';
 
@@ -32,51 +37,6 @@ function ow_http_get($url, $timeout = 20) {
     $err  = curl_error($ch);
     curl_close($ch);
     return ['code' => $code, 'body' => $body, 'err' => $err];
-}
-
-function owjob_query($battletag) {
-    $tag_enc = urlencode($battletag);
-
-    // 1. precheck
-    $url = "https://owjob.online/api/precheck?id={$tag_enc}&t=" . round(microtime(true) * 1000);
-    $r = ow_http_get($url, 25);
-    if ($r['code'] === 0) return ['err' => '无法连接 owjob.online（服务器到 owjob.online 不通）：' . $r['err']];
-    if ($r['code'] !== 200) return ['err' => "precheck 失败 HTTP {$r['code']}"];
-    $j = json_decode($r['body'], true);
-    if (!$j || empty($j['ok'])) return ['err' => 'precheck 返回异常：' . substr((string)$r['body'], 0, 200)];
-
-    $job_id = $j['job_id'] ?? '';
-    if (!$job_id) {
-        $line = $j['precheck']['line'] ?? '没找到该玩家';
-        return ['err' => "owjob 未能解析这个 BattleTag：{$line}"];
-    }
-
-    // 2. poll job —— 最多 90 秒，每 2 秒一次
-    $deadline = time() + 90;
-    $last_progress = '';
-    while (time() < $deadline) {
-        $u = "https://owjob.online/api/job?job_id=" . urlencode($job_id) . "&t=" . round(microtime(true) * 1000);
-        $r2 = ow_http_get($u, 12);
-        if ($r2['code'] === 200) {
-            $jj = json_decode($r2['body'], true);
-            $st = $jj['job']['status'] ?? '';
-            $last_progress = $jj['job']['progress'] ?? $last_progress;
-            if (!empty($jj['job']['error'])) return ['err' => 'owjob 任务出错：' . $jj['job']['error']];
-            if ($st === 'done' || !empty($jj['job']['ready'])) break;
-        }
-        sleep(2);
-    }
-    if (time() >= $deadline) {
-        return ['err' => 'owjob 处理超时（>90秒）。当前状态：' . ($last_progress ?: '未知')];
-    }
-
-    // 3. result
-    $u3 = "https://owjob.online/api/result?job_id=" . urlencode($job_id) . "&t=" . round(microtime(true) * 1000);
-    $r3 = ow_http_get($u3, 50);
-    if ($r3['code'] !== 200) return ['err' => "result 拉取失败 HTTP {$r3['code']}"];
-    $jr = json_decode($r3['body'], true);
-    if (!$jr || empty($jr['ok'])) return ['err' => 'result 返回异常'];
-    return ['data' => $jr['result'] ?? null, 'job_id' => $job_id];
 }
 
 // 国际服走 OverFast；BattleTag 形如 Player#1234，OverFast 用 - 替代 #
@@ -150,19 +110,23 @@ function call_deepseek_intl($battletag, $intl_data, $history, $key, $base_url, $
 
     $sys = "你是一位经验丰富、风格直接的守望先锋（Overwatch 2）教练，信奉「严师出高徒」——敢戳痛点，但每一刀都为了让玩家变强。\n" .
            "你拿到的是国际服 OverFast 数据：含段位（按 tank/damage/support 角色）、对局总览（场次/胜率/KDA/总时长）、按时长排序的常用英雄。\n" .
-           "你的任务：基于这些数据，输出一份直率、犀利、但建设性的中文教练建议。\n" .
+           "你的任务：基于这些数据，输出一份直率、犀利、但建设性的中文教练分析。\n\n" .
            "硬性要求：\n" .
            "1. 全部用简体中文。\n" .
-           "2. 结构化为五节：【核心画像】【强项】【弱项】【针对性提升建议】【推荐练习套路】。\n" .
-           "3. 每节给具体英雄/玩法/技能/位置/团队定位层面的可执行建议，不要空话套话。\n" .
-           "4. 允许犀利、直接甚至带刺的语气，但有两条铁律——\n" .
-           "   (a) 每一句批评后面必须紧跟具体的「下一步怎么改」，只骂不教学绝对不行；\n" .
-           "   (b) 攻击点必须落在\"具体行为或选择\"，不攻击玩家本人或人格。\n" .
-           "5. 收束基调：刀子嘴豆腐心。\n" .
-           "6. 数据不足时只在已有数据范围内分析。";
+           "2. **严格按这五个段落输出，标题必须原样使用【】包裹**：\n" .
+           "   【核心画像】 — 3–5 行综合判断；如果有历史快照，开头追加 2–3 行「最近变化」（带数字，例：\"胜率 48%→55%\"）。\n" .
+           "   【位置诊断】 — 针对玩家三个角色（坦克/输出/辅助）里实际上场最多的位置点评，至少 3 条短点评，每条 ≤30 字。\n" .
+           "   【英雄玩法画像】 — 针对常用英雄/玩法倾向（突进/枪男/输出辅助/前排压制 等），2–4 条短点评。\n" .
+           "   【维度提醒】 — 针对段位、胜率、KDA、英雄池广度 这些维度里**最差的 2–3 项**，逐条点出问题，每条 ≤30 字。\n" .
+           "   【改进建议】 — 3–5 条 actionable 建议，每条形如\"做 X 来解决 Y\"，必须可立即执行。\n" .
+           "3. 允许犀利、直接甚至带刺的语气，但有两条铁律——\n" .
+           "   (a) 攻击点必须落在\"具体行为或选择\"，不攻击玩家本人/人格。\n" .
+           "   (b) 【改进建议】里给的每一条必须可执行。\n" .
+           "4. 收束基调：刀子嘴豆腐心。\n" .
+           "5. 数据不足时只在已有数据范围内分析。";
 
     if (!empty($history_compact)) {
-        $sys .= "\n7. **历史对比**：本次输入除了 current，还附带了同一玩家的 history 快照（按时间倒序）。请在【核心画像】开头追加一段「最近变化」(2–4 行)，明确点出综合胜率、KDA、英雄选择的涨跌（带数字），并在【强项】【弱项】里呼应。变化不显著就直说。";
+        $sys .= "\n6. **历史对比强化**：本次 user 输入包含 history 快照（按时间倒序）。【核心画像】开头的「最近变化」必须明确点出综合胜率、KDA、英雄选择的涨跌（带数字），并在【位置诊断】/【维度提醒】里呼应。变化不显著就直说。";
     }
 
     $body = [
@@ -201,73 +165,77 @@ function call_deepseek_intl($battletag, $intl_data, $history, $key, $base_url, $
     return ['ok'=>true, 'text'=>$content];
 }
 
-function call_deepseek($battletag, $owjob_result, $history, $key, $base_url, $model) {
+// 国服 ds163 官方数据用单独的 DeepSeek 调用（客观数据：段位/各位置胜率KDA/场均）
+function call_deepseek_ds163($battletag, $ds_data, $history, $key, $base_url, $model) {
     if (!$key) return ['ok'=>false, 'msg'=>'未配置 DeepSeek API Key，请到 后台 → 系统设置 → AI 配置 中填写。'];
-
     $base_url = rtrim($base_url ?: 'https://api.deepseek.com', '/');
     $model    = $model ?: 'deepseek-chat';
 
-    // 把一份 owjob 数据压缩成对比友好的紧凑结构
-    $shrink = function($r, $hero_n = 12) {
-        return [
-            'mode_label'             => $r['mode_label']             ?? null,
-            'sample_size'            => $r['sample_size']            ?? null,
-            'overall_score'          => $r['score']                  ?? null,
-            'low_contribution_share' => $r['low_contribution_share'] ?? null,
-            'metrics' => array_map(function($a){
-                return ['label'=>$a['label']??null, 'value'=>$a['value']??null];
-            }, (array)($r['analysis'] ?? [])),
-            'heroes' => array_map(function($h){
-                return [
-                    'hero'    => $h['hero']    ?? null,
-                    'state'   => $h['state']   ?? null,
-                    'matches' => $h['matches'] ?? null,
-                    'score'   => $h['score']   ?? null,
-                ];
-            }, array_slice((array)($r['hero_judgements'] ?? []), 0, $hero_n)),
+    $role_cn = ['tank'=>'坦克', 'dps'=>'输出', 'healer'=>'辅助', 'open'=>'自由组队'];
+    $shrink = function($d) use ($role_cn) {
+        $p = $d['profile'] ?? [];
+        $out = [
+            'level'         => $p['level']         ?? null,
+            'game_time_h'   => $p['gameTime']      ?? null,
+            'total_matches' => $p['totalMatchNum'] ?? null,
         ];
+        foreach (['sport'=>'竞技', 'leisure'=>'快速'] as $mode => $lbl) {
+            $m = $d[$mode] ?? null;
+            if (!is_array($m) || empty($m['guideCountData'])) continue;
+            $roles = [];
+            foreach ((array)$m['guideCountData'] as $g) {
+                $rk = $g['lastRankInfo']['rankName'] ?? 'None';
+                $roles[] = [
+                    'role'         => $role_cn[$g['roleType'] ?? ''] ?? ($g['roleType'] ?? '?'),
+                    'matches'      => $g['matchSum']     ?? null,
+                    'winRate'      => $g['winRate']      ?? null,
+                    'kda'          => $g['kda']          ?? null,
+                    'rank'         => ($rk === 'None') ? '未定级' : trim($rk . ' ' . ($g['lastRankInfo']['rankSubTier'] ?? '')),
+                    'maxWinStreak' => $g['maxWinStreak'] ?? null,
+                ];
+            }
+            $s = $m['presetsSummaryData'] ?? [];
+            $out[$lbl] = ['roles' => $roles, 'avg' => [
+                'kill'=>$s['aveKill']??null, 'death'=>$s['aveDeath']??null, 'assist'=>$s['aveAssist']??null,
+                'heroDamage'=>$s['aveHeroDamage']??null, 'cure'=>$s['aveCure']??null, 'resistDamage'=>$s['aveResistDamage']??null,
+                'winRate'=>$s['winRate']??null,
+            ]];
+        }
+        return $out;
     };
 
-    $current = ['snapshot_at' => date('Y-m-d H:i')] + $shrink($owjob_result, 12);
-
-    // 历史快照（按时间倒序，最近的在前）
+    $current = ['snapshot_at'=>date('Y-m-d H:i')] + $shrink($ds_data);
     $history_compact = [];
     foreach ((array)$history as $h) {
         if (empty($h['data'])) continue;
-        $history_compact[] = ['snapshot_at' => date('Y-m-d H:i', strtotime($h['created_at']))]
-            + $shrink($h['data'], 6);
+        $history_compact[] = ['snapshot_at'=>date('Y-m-d H:i', strtotime($h['created_at']))] + $shrink($h['data']);
     }
-
-    $payload = ['battle_tag' => $battletag, 'current' => $current];
-    if (!empty($history_compact)) $payload['history'] = $history_compact;
+    $payload = ['battle_tag'=>$battletag, 'region'=>'国服(官方)', 'current'=>$current];
+    if ($history_compact) $payload['history'] = $history_compact;
 
     $sys = "你是一位经验丰富、风格直接的守望先锋（Overwatch 2）教练，信奉「严师出高徒」——敢戳痛点，但每一刀都为了让玩家变强。\n" .
-           "你拿到的数据由第三方平台预分析后给出。\n" .
-           "你的任务：基于其量化指标和英雄数据，输出一份直率、犀利、但建设性的中文教练建议。\n" .
+           "你拿到的是国服官方战绩数据：含等级/总时长/总场次，竞技与快速两种模式下各位置（坦克/输出/辅助）的段位、场次、胜率、KDA、最高连胜，以及场均击杀/死亡/助攻/伤害/治疗/承伤。\n" .
+           "你的任务：基于这些客观数据，输出一份直率、犀利、但建设性的中文教练分析。\n\n" .
            "硬性要求：\n" .
            "1. 全部用简体中文。\n" .
-           "2. 结构化为五节：【核心画像】【强项】【弱项】【针对性提升建议】【推荐练习套路】。\n" .
-           "3. 每节给具体英雄/玩法/技能/位置/团队定位层面的可执行建议，不要空话套话。\n" .
-           "4. 允许犀利、直接甚至带刺的语气（\"挖坑\"\"摆烂\"\"抽风\"\"看不到团队\"\"养成型送头\"等表达可以用），但有两条铁律——\n" .
-           "   (a) 每一句批评后面必须紧跟具体的「下一步怎么改」（位置/键位/技能时机/英雄选择/沟通），只骂不教学绝对不行；\n" .
-           "   (b) 攻击点必须落在\"具体行为或选择\"（走位、视野、技能用法、英雄池、定位），永远不攻击玩家这个人、智商或人格。\n" .
-           "5. 收束基调：刀子嘴豆腐心——前面戳得痛、中间讲清楚为什么烂、结尾给一条让玩家\"明天就想开 OW 练一把\"的可执行路径。\n" .
-           "6. 数据不足时只在已有数据范围内分析，明确说明哪里数据不够，不要编造。";
-
-    if (!empty($history_compact)) {
-        $sys .= "\n7. **历史对比**：本次输入除了 current，还附带了同一玩家的 history 快照（按时间倒序）。请在【核心画像】开头追加一段「最近变化」(2–4 行)，明确点出：\n" .
-                "   - 综合分、关键指标的涨/跌（要带数字，例：\"压制 37→52，长进了\"）；\n" .
-                "   - 英雄选择/熟练度的变化趋势（练新英雄了？放弃了某英雄？）；\n" .
-                "   - 在【强项】/【弱项】里要呼应这个对比，强化\"哪块进步要保持、哪块掉了要补\"的诊断。\n" .
-                "   如果两次数据样本差距太大或时间太近变化不明显，**直接说\"对比变化不显著\"**，不要硬编造对比。";
+           "2. **严格按这五个段落输出，标题必须原样使用【】包裹**：\n" .
+           "   【核心画像】 — 3–5 行综合判断；有历史快照则开头追加 2–3 行「最近变化」（带数字，例：\"胜率 48%→55%\"）。\n" .
+           "   【位置诊断】 — 针对实际上场最多的位置点评，至少 3 条，每条 ≤30 字。\n" .
+           "   【英雄玩法画像】 — 从各位置胜率/KDA/场均数据反推玩法倾向（输出型奶/激进坦/苟命C 等），2–4 条。\n" .
+           "   【维度提醒】 — 段位、胜率、KDA、场均死亡、伤害/治疗效率 里**最差的 2–3 项**，逐条点出，每条 ≤30 字。\n" .
+           "   【改进建议】 — 3–5 条 actionable 建议，每条形如\"做 X 来解决 Y\"，可立即执行。\n" .
+           "3. 允许犀利、直接甚至带刺，但两条铁律：(a) 攻击点落在\"具体行为或选择\"，不攻击玩家本人；(b)【改进建议】每条必须可执行。\n" .
+           "4. 收束基调：刀子嘴豆腐心。\n" .
+           "5. 数据不足（如竞技无数据/段位未定级）时只在已有数据范围内分析，不编造。";
+    if ($history_compact) {
+        $sys .= "\n6. **历史对比强化**：user 输入含 history 快照（时间倒序）。【核心画像】开头点出胜率/KDA/段位的涨跌（带数字），并在【位置诊断】/【维度提醒】呼应。变化不显著就直说。";
     }
 
     $body = [
         'model' => $model,
         'messages' => [
-            ['role' => 'system', 'content' => $sys],
-            ['role' => 'user',   'content' =>
-                "请基于以下战绩 JSON 进行分析与建议：\n\n```json\n" .
+            ['role'=>'system', 'content'=>$sys],
+            ['role'=>'user',   'content'=>"请基于以下国服官方战绩 JSON 进行分析与建议：\n\n```json\n" .
                 json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . "\n```"],
         ],
         'temperature' => 0.5,
@@ -280,24 +248,142 @@ function call_deepseek($battletag, $owjob_result, $history, $key, $base_url, $mo
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT        => 90,
         CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_HTTPHEADER     => [
-            'Content-Type: application/json',
-            'Authorization: Bearer ' . $key,
-        ],
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'Authorization: Bearer ' . $key],
         CURLOPT_POSTFIELDS     => json_encode($body, JSON_UNESCAPED_UNICODE),
     ]);
     $resp_body = curl_exec($ch);
     $resp_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $err       = curl_error($ch);
     curl_close($ch);
-
-    if ($resp_code !== 200) {
-        return ['ok'=>false, 'msg'=>"DeepSeek 调用失败 HTTP {$resp_code}：" . ($err ?: substr((string)$resp_body, 0, 300))];
-    }
+    if ($resp_code !== 200) return ['ok'=>false, 'msg'=>"DeepSeek 调用失败 HTTP {$resp_code}：" . ($err ?: substr((string)$resp_body, 0, 300))];
     $j = json_decode($resp_body, true);
     $content = $j['choices'][0]['message']['content'] ?? '';
     if ($content === '') return ['ok'=>false, 'msg'=>'DeepSeek 返回为空'];
     return ['ok'=>true, 'text'=>$content];
+}
+
+// 用 ds163 客观数据算六维雷达（竞技优先，无则快速；各轴 0–100，凭经验阈值估算）
+function build_radar_ds163($data) {
+    $m = null;
+    foreach (['sport', 'leisure'] as $mode) {
+        if (!empty($data[$mode]['presetsSummaryData'])) { $m = $data[$mode]; break; }
+    }
+    if (!$m) return null;
+    $s = $m['presetsSummaryData'];
+    // 主位置（场次最多）的胜率/KDA
+    $wr = $s['winRate'] ?? 50; $kda = 0; $best = -1;
+    foreach ((array)($m['guideCountData'] ?? []) as $g) {
+        if (($g['matchSum'] ?? 0) > $best) { $best = $g['matchSum'] ?? 0; $wr = $g['winRate'] ?? $wr; $kda = $g['kda'] ?? 0; }
+    }
+    $clamp = function($v){ return (int)round(max(0, min(100, $v))); };
+    $contrib = max(((float)($s['aveHeroDamage'] ?? 0))/8000, ((float)($s['aveCure'] ?? 0))/10000, ((float)($s['aveResistDamage'] ?? 0))/8000) * 100;
+    return [
+        '胜率' => $clamp((float)$wr),
+        'KDA'  => $clamp((float)$kda / 5 * 100),
+        '击杀' => $clamp((float)($s['aveKill'] ?? 0) / 15 * 100),
+        '生存' => $clamp(100 - (float)($s['aveDeath'] ?? 6) * 8),
+        '参团' => $clamp((float)($s['aveAssist'] ?? 0) / 15 * 100),
+        '贡献' => $clamp($contrib),
+    ];
+}
+
+// ── OWL 战队 / 职业选手匹配（基于 build_radar_ds163 的六维画像）──
+$OWL_TEAMS = [
+    '上海龙之队 Shanghai Dragons'  => ['tagline'=>'突袭爆发 · 团战切入凶', 'weights'=>['击杀'=>3,'参团'=>1,'生存'=>-1], 'desc'=>'敢冲敢秀，开团定生死。继续练先手切入，但记得回头看队友跟没跟上。'],
+    '首尔王朝 Seoul Dynasty'       => ['tagline'=>'韩系老牌 · 教科书压制', 'weights'=>['胜率'=>2,'KDA'=>2,'生存'=>1], 'desc'=>'靠基本功碾人，少花活多稳赢。继续打磨核心英雄的细节。'],
+    '旧金山震动 SF Shock'          => ['tagline'=>'全能 meta · 六边形战士', 'weights'=>['胜率'=>1,'KDA'=>1,'击杀'=>1,'生存'=>1,'参团'=>1,'贡献'=>1], 'desc'=>'没有明显短板，meta 一变就能跟上。保持英雄池广度，别陷进单一英雄。'],
+    '达拉斯燃料 Dallas Fuel'       => ['tagline'=>'团队运营 · 节奏控制', 'weights'=>['贡献'=>2,'参团'=>2,'KDA'=>1], 'desc'=>'不浪不送，靠节奏累积优势。后期发力型，警惕"过稳"导致节奏拖沓。'],
+    '亚特兰大君临 Atlanta Reign'   => ['tagline'=>'稳守反击 · 后发制人', 'weights'=>['生存'=>2,'贡献'=>2,'胜率'=>1], 'desc'=>'站得住、耗得起。守家英雄最大化优势，但要练点开团别太被动。'],
+    '华盛顿正义 Washington Justice'=> ['tagline'=>'灵活多变 · 临场应变', 'weights'=>['参团'=>2,'击杀'=>1,'KDA'=>1], 'desc'=>'阵容多变、应变快。多读对位、磨好 BO 选英雄的能力。'],
+];
+$OWL_PLAYERS = [
+    'dps' => [
+        ['name'=>'Fleta（上海龙之队）','tag'=>'Carry 型输出','axes'=>['胜率'=>70,'KDA'=>80,'击杀'=>90,'生存'=>50,'参团'=>60,'贡献'=>70],'desc'=>'一打多的大核，全队输出靠你扛。'],
+        ['name'=>'Profit（伦敦喷火）','tag'=>'全能稳定输出','axes'=>['胜率'=>80,'KDA'=>85,'击杀'=>75,'生存'=>70,'参团'=>70,'贡献'=>60],'desc'=>'英雄池深，关键团从不掉链子。'],
+        ['name'=>'Carpe（费城融合）','tag'=>'激进神枪','axes'=>['胜率'=>60,'KDA'=>70,'击杀'=>95,'生存'=>40,'参团'=>50,'贡献'=>60],'desc'=>'极致输出，站桩火力压制。'],
+    ],
+    'tank' => [
+        ['name'=>'Mano（纽约九霄天擎）','tag'=>'稳健前排','axes'=>['胜率'=>75,'KDA'=>70,'击杀'=>50,'生存'=>85,'参团'=>70,'贡献'=>80],'desc'=>'前排定海神针，站位滴水不漏。'],
+        ['name'=>'Fate（上海龙之队）','tag'=>'激进开团坦','axes'=>['胜率'=>65,'KDA'=>60,'击杀'=>80,'生存'=>50,'参团'=>85,'贡献'=>70],'desc'=>'先手开团狂魔，节奏带动者。'],
+        ['name'=>'Super（旧金山震动）','tag'=>'全能主坦','axes'=>['胜率'=>80,'KDA'=>70,'击杀'=>60,'生存'=>75,'参团'=>80,'贡献'=>75],'desc'=>'攻守兼备，团队大脑。'],
+    ],
+    'healer' => [
+        ['name'=>'JJoNak（纽约九霄天擎）','tag'=>'输出型奶','axes'=>['胜率'=>70,'KDA'=>70,'击杀'=>80,'生存'=>55,'参团'=>85,'贡献'=>75],'desc'=>'会输出的禅雅塔，奶量与伤害两开花。'],
+        ['name'=>'Viol2t（旧金山震动）','tag'=>'稳健治疗','axes'=>['胜率'=>80,'KDA'=>75,'击杀'=>45,'生存'=>80,'参团'=>70,'贡献'=>90],'desc'=>'治疗量拉满，后排稳如老狗。'],
+        ['name'=>'Anamo（纽约九霄天擎）','tag'=>'团队辅助','axes'=>['胜率'=>75,'KDA'=>70,'击杀'=>50,'生存'=>70,'参团'=>85,'贡献'=>80],'desc'=>'团队节奏的粘合剂，视野与配合一流。'],
+    ],
+];
+
+// 主位置（竞技+快速里累计场次最多的 roleType）
+function ds163_main_role($data) {
+    $cnt = [];
+    foreach (['sport', 'leisure'] as $m) {
+        foreach ((array)($data[$m]['guideCountData'] ?? []) as $g) {
+            $r = $g['roleType'] ?? ''; if ($r === '') continue;
+            $cnt[$r] = ($cnt[$r] ?? 0) + ($g['matchSum'] ?? 0);
+        }
+    }
+    if (!$cnt) return 'open';
+    arsort($cnt);
+    reset($cnt);
+    return (string)key($cnt);
+}
+
+// 用六维画像匹配最契合的 OWL 战队 + 最神似的职业选手
+function match_owl($radar, $main_role) {
+    global $OWL_TEAMS, $OWL_PLAYERS;
+    // 战队：按权重对「偏离中位 50」加权
+    $bestT = null; $bestTs = -INF;
+    foreach ($OWL_TEAMS as $name => $info) {
+        $sc = 0; $aw = 0;
+        foreach ($info['weights'] as $ax => $w) { $sc += (($radar[$ax] ?? 50) - 50) * $w; $aw += abs($w); }
+        $norm = $aw ? $sc / (50 * $aw) : 0;
+        if ($norm > $bestTs) { $bestTs = $norm; $bestT = ['name'=>$name] + $info; }
+    }
+    if ($bestT) $bestT['match_pct'] = max(0, min(100, (int)round(($bestTs + 1) * 50)));
+    // 选手：在主位置池里取六维欧氏距离最近的（open/未知用全池）
+    $pool = $OWL_PLAYERS[$main_role] ?? [];
+    if (!$pool) foreach ($OWL_PLAYERS as $g) $pool = array_merge($pool, $g);
+    $bestP = null; $bestPd = INF;
+    foreach ($pool as $pl) {
+        $d = 0;
+        foreach (['胜率','KDA','击杀','生存','参团','贡献'] as $ax) $d += pow(($radar[$ax] ?? 50) - ($pl['axes'][$ax] ?? 50), 2);
+        if ($d < $bestPd) { $bestPd = $d; $bestP = $pl; }
+    }
+    if ($bestP) $bestP['match_pct'] = max(40, min(99, (int)round(100 - sqrt($bestPd / 6))));
+    return ['team'=>$bestT, 'player'=>$bestP];
+}
+
+// 缓存/历史表（被删 owjob 死代码时误删，现恢复）
+function ensure_ow_queries_table($conn) {
+    static $done = false;
+    if ($done) return;
+    $conn->query("CREATE TABLE IF NOT EXISTS ow_queries (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        battletag VARCHAR(100) NOT NULL,
+        region VARCHAR(8) NOT NULL DEFAULT 'cn',
+        owjob_data MEDIUMTEXT,
+        deepseek_advice MEDIUMTEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_user (user_id, created_at),
+        INDEX idx_tag_region_time (battletag, region, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    $col = $conn->query("SHOW COLUMNS FROM ow_queries LIKE 'region'");
+    if ($col && $col->num_rows === 0) {
+        $conn->query("ALTER TABLE ow_queries ADD COLUMN region VARCHAR(8) NOT NULL DEFAULT 'cn' AFTER battletag");
+        $conn->query("CREATE INDEX idx_tag_region_time ON ow_queries (battletag, region, created_at)");
+    }
+    $done = true;
+}
+
+function time_ago_cn($ts) {
+    $diff = time() - strtotime($ts);
+    if ($diff < 60)        return '刚刚';
+    if ($diff < 3600)      return floor($diff/60)   . '分钟前';
+    if ($diff < 86400)     return floor($diff/3600) . '小时前';
+    if ($diff < 86400*30)  return floor($diff/86400). '天前';
+    return date('m-d H:i', strtotime($ts));
 }
 
 // ── 主流程 ──
@@ -350,14 +436,19 @@ elseif ($battletag_in !== '') {
                 $conn->query("INSERT INTO ow_queries (user_id, battletag, region, owjob_data, deepseek_advice) VALUES ({$uid}, '{$tag_esc}', '{$reg_esc}', '{$dj}', '{$av}')");
             }
         } else {
-            // 真查 —— 按 region 分流
-            $r = ($region === 'intl') ? overfast_query($battletag_in) : owjob_query($battletag_in);
+            // 真查 —— 按 region 分流（国服=网易大神官方直连，国际=OverFast）
+            if ($region === 'intl') {
+                $r = overfast_query($battletag_in);
+            } else {
+                $prof = ds163_full_profile(ds163_load_credentials($conn), $battletag_in);
+                $r = $prof['ok'] ? ['data' => $prof] : ['err' => $prof['msg'] ?? '国服查询失败'];
+            }
             if (!empty($r['err'])) {
                 $error = $r['err'];
             } else {
                 $data = $r['data'];
                 if (!$data) {
-                    $error = ($region === 'intl' ? 'OverFast' : 'owjob') . ' 返回空数据';
+                    $error = ($region === 'intl' ? 'OverFast' : '国服官方接口') . ' 返回空数据';
                 } else {
                     // 抓本 BattleTag + region 的过往快照（最近 3 次）— 在落库之前查
                     $history_snapshots = [];
@@ -374,8 +465,8 @@ elseif ($battletag_in !== '') {
                     $ds_base_url = get_setting($conn, 'deepseek_base_url', 'https://api.deepseek.com');
                     $ds_model    = get_setting($conn, 'deepseek_model',    'deepseek-chat');
                     $ds = ($region === 'intl')
-                        ? call_deepseek_intl($battletag_in, $data, $history_snapshots, $ds_key, $ds_base_url, $ds_model)
-                        : call_deepseek     ($battletag_in, $data, $history_snapshots, $ds_key, $ds_base_url, $ds_model);
+                        ? call_deepseek_intl ($battletag_in, $data, $history_snapshots, $ds_key, $ds_base_url, $ds_model)
+                        : call_deepseek_ds163($battletag_in, $data, $history_snapshots, $ds_key, $ds_base_url, $ds_model);
                     if ($ds['ok']) $advice = $ds['text'];
                     else           $ds_error = $ds['msg'];
 
@@ -393,6 +484,42 @@ elseif ($battletag_in !== '') {
 $history_items = [];
 $hl = $conn->query("SELECT id, battletag, region, created_at, owjob_data FROM ow_queries WHERE user_id={$uid} ORDER BY created_at DESC LIMIT 8");
 if ($hl) while ($row = $hl->fetch_assoc()) $history_items[] = $row;
+
+// 把 DeepSeek 输出按【...】标题切成段落卡片
+// 返回 [['title'=>'核心画像','body'=>'...'], ...]；若没有任何标题则返回单条 fallback
+function parse_owpa_sections($s) {
+    $s = trim((string)$s);
+    if ($s === '') return [];
+    // 用行首【xxx】当锚点切段（避免正文里的【】被误切）
+    if (!preg_match('/(^|\n)\s*【[^】]+】/u', $s)) {
+        return [['title' => '', 'body' => $s]];
+    }
+    $parts = preg_split('/\n(?=\s*【[^】]+】)/u', "\n" . $s);
+    $out = [];
+    foreach ($parts as $p) {
+        $p = trim($p);
+        if ($p === '') continue;
+        if (preg_match('/^【([^】]+)】\s*(.*)$/us', $p, $m)) {
+            $out[] = ['title' => trim($m[1]), 'body' => trim($m[2])];
+        } else {
+            // 第一段如果没标题，归到「前言」
+            $out[] = ['title' => '', 'body' => $p];
+        }
+    }
+    return $out;
+}
+
+// 段落标题 -> CSS 类后缀（决定卡片左边条颜色）
+function owpa_section_kind($title) {
+    $map = [
+        '核心画像' => 'core',
+        '位置诊断' => 'role',
+        '英雄玩法画像' => 'hero',
+        '维度提醒' => 'dim',
+        '改进建议' => 'fix',
+    ];
+    return $map[$title] ?? 'misc';
+}
 
 // 简易 markdown
 function mini_md($s) {
@@ -413,188 +540,6 @@ function mini_md($s) {
     $s = preg_replace('/<p>(\s*<(h2|h3|h4|ul)>)/', '$1', $s);
     $s = preg_replace('/(<\/(h2|h3|h4|ul)>\s*)<\/p>/', '$1', $s);
     return $s;
-}
-
-// 比例数字格式化
-function fmt_pct($v) {
-    if ($v === null || $v === '') return '—';
-    if (is_numeric($v) && $v <= 1.5) return round($v * 100, 1) . '%';
-    return htmlspecialchars((string)$v);
-}
-
-// ── 缓存与历史 ──
-const OW_CACHE_TTL_HOURS = 6;
-
-function ensure_ow_queries_table($conn) {
-    static $done = false;
-    if ($done) return;
-    $conn->query("CREATE TABLE IF NOT EXISTS ow_queries (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT NOT NULL,
-        battletag VARCHAR(100) NOT NULL,
-        region VARCHAR(8) NOT NULL DEFAULT 'cn',
-        owjob_data MEDIUMTEXT,
-        deepseek_advice MEDIUMTEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_user (user_id, created_at),
-        INDEX idx_tag_region_time (battletag, region, created_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-    // 旧表升级：若没有 region 列就补一个
-    $col = $conn->query("SHOW COLUMNS FROM ow_queries LIKE 'region'");
-    if ($col && $col->num_rows === 0) {
-        $conn->query("ALTER TABLE ow_queries ADD COLUMN region VARCHAR(8) NOT NULL DEFAULT 'cn' AFTER battletag");
-        $conn->query("CREATE INDEX idx_tag_region_time ON ow_queries (battletag, region, created_at)");
-    }
-    $done = true;
-}
-
-function time_ago_cn($ts) {
-    $diff = time() - strtotime($ts);
-    if ($diff < 60)        return '刚刚';
-    if ($diff < 3600)      return floor($diff/60)   . '分钟前';
-    if ($diff < 86400)     return floor($diff/3600) . '小时前';
-    if ($diff < 86400*30)  return floor($diff/86400). '天前';
-    return date('m-d H:i', strtotime($ts));
-}
-
-// owjob 的 label 含义字典：关键词 => [一句话解释, 雷达轴名 (null=不上雷达), 是否需要反转方向(高=差则 true)]
-$LABEL_HINTS = [
-    '人机浓度'  => ['你最近的发挥跟人机 BOT 的相似度，越高越像人机',                '人味',  true],
-    '挖坑'      => ['明显拖累团队的对局占比，越高越爱挖坑',                          '不挖坑', true],
-    '本职'      => ['在自己角色上完成本职责任的得分，越高越尽责',                    '本职',   false],
-    '抽风'      => ['发挥稳定性反向得分，越高代表越容易突然失常',                    '稳定',   true],
-    '压得住'    => ['对线和团战中的压制力得分，越高越能压人',                        '压制',   false],
-    '别先躺'    => ['团战生存能力得分，越高越能站住',                                '生存',   false],
-    '常驻背锅'  => ['你最常承担「背锅」角色的位置（坦/输出/辅助）',                  null,    false],
-    '低贡献'    => ['团战贡献低于队友均值的对局占比，越高越爱划水',                  null,    true],
-];
-
-// 解析 label：剥前缀（"最烂一项："/"暂时没烂穿："）后匹配关键词
-function analyze_label($label) {
-    global $LABEL_HINTS;
-    $core = preg_replace('/^(最烂一项|暂时没烂穿)[：:]\s*/u', '', (string)$label);
-    foreach ($LABEL_HINTS as $kw => $info) {
-        if (mb_strpos($core, $kw) !== false) {
-            return ['core'=>$core, 'hint'=>$info[0], 'theme'=>$info[1], 'invert'=>$info[2]];
-        }
-    }
-    return ['core'=>$core, 'hint'=>null, 'theme'=>null, 'invert'=>false];
-}
-
-// 把 owjob 数值（数字或带 % 的字符串）转成 0–100 得分；invert=true 则反转方向
-function to_score($v, $invert) {
-    if ($v === null || $v === '' || $v === '-') return null;
-    $s = trim((string)$v);
-    if (preg_match('/^([\d.]+)\s*%$/', $s, $m)) $n = floatval($m[1]);
-    elseif (is_numeric($s)) $n = floatval($s);
-    else return null;
-    $n = max(0, min(100, $n));
-    return $invert ? (100 - $n) : $n;
-}
-
-// 从 owjob analysis 数组里抽出 6 个雷达轴的得分
-function build_radar_axes($analysis) {
-    $axes = ['本职'=>null, '压制'=>null, '稳定'=>null, '生存'=>null, '人味'=>null, '不挖坑'=>null];
-    foreach ((array)$analysis as $a) {
-        $info = analyze_label($a['label'] ?? '');
-        if (!$info['theme'] || !array_key_exists($info['theme'], $axes)) continue;
-        $sc = to_score($a['value'] ?? null, $info['invert']);
-        if ($sc === null) continue;
-        // 同一个轴出现多个值时取较低的（露怯优先）
-        $axes[$info['theme']] = ($axes[$info['theme']] === null) ? $sc : min($axes[$info['theme']], $sc);
-    }
-    foreach ($axes as $k=>$v) if ($v === null) $axes[$k] = 50; // 缺失补 50（中位）
-    return $axes;
-}
-
-// 战队风格 → 雷达 6 轴的核心权重（负数表示该轴低反而契合）
-$TEAM_PROFILES = [
-    '首尔王朝 Seoul Dynasty' => [
-        'tagline' => '韩系老牌 · 教科书对线压制',
-        'desc'    => '每团都把对位吃干净，靠基本功碾人。继续打磨核心英雄的细节，少花活、多稳赢。',
-        'weights' => ['压制'=>2, '稳定'=>2, '本职'=>1],
-    ],
-    '旧金山震动 SF Shock' => [
-        'tagline' => '全能 meta · 六边形战士',
-        'desc'    => '没有明显短板，meta 一变你就能跟上。继续保持英雄池广度，别陷进单一英雄。',
-        'weights' => ['本职'=>1, '压制'=>1, '稳定'=>1, '生存'=>1, '人味'=>1, '不挖坑'=>1],
-    ],
-    '上海龙之队 Shanghai Dragons' => [
-        'tagline' => '突袭爆发 · 团战切入凶',
-        'desc'    => '敢冲、敢秀，开团决定整局走向。继续练先手切入英雄（猎空/索杰恩/D.Va），但要记得回头看队友跟没跟上。',
-        'weights' => ['压制'=>3, '人味'=>1, '生存'=>-1],
-    ],
-    '达拉斯燃料 Dallas Fuel' => [
-        'tagline' => '经济型运营 · 节奏控制',
-        'desc'    => '不浪不送，靠节奏累积优势。这种打法适合后期发力，但要警惕"过于稳"导致的节奏拖沓。',
-        'weights' => ['稳定'=>2, '不挖坑'=>2, '本职'=>1],
-    ],
-    '休斯顿前锋 Houston Outlaws' => [
-        'tagline' => '防守硬刚 · 守点专家',
-        'desc'    => '对面打不死你。守家英雄（堡垒/法老之鹰/巴蒂斯特）能给你最大化优势，但要练点开团能力别一直被动。',
-        'weights' => ['生存'=>2, '本职'=>2, '不挖坑'=>1],
-    ],
-    '杭州闪电 Hangzhou Spark' => [
-        'tagline' => '灵活应变 · 变阵大师',
-        'desc'    => '阵容多变、临场应变快。继续保持英雄池广度，多关注 BO 选英雄的对位读秒能力。',
-        'weights' => ['人味'=>2, '本职'=>2, '压制'=>1],
-    ],
-    '温哥华泰坦 Vancouver Titans' => [
-        'tagline' => '死亡突进 · 激进 dive',
-        'desc'    => '高风险高回报，开团狂魔。强项是把比赛节奏拉到自己的舒适区，但 dive 失败的代价你得能扛。',
-        'weights' => ['压制'=>2, '人味'=>2, '生存'=>-2],
-    ],
-    '伦敦喷火 London Spitfire' => [
-        'tagline' => '宏观运营 · 战略脑',
-        'desc'    => '会看大局，能做正确的决策。这种打法在排位里偏吃亏（队友不一定听你的），但在固定团队里你就是定海神针。',
-        'weights' => ['不挖坑'=>3, '本职'=>2, '人味'=>1],
-    ],
-];
-
-// 把雷达 6 轴跟战队权重模板做加权匹配，返回最佳战队 + 匹配度
-function match_team($axes) {
-    global $TEAM_PROFILES;
-    $best = null; $best_score = -INF;
-    foreach ($TEAM_PROFILES as $name => $info) {
-        $score = 0; $abs_w = 0;
-        foreach ($info['weights'] as $axis => $w) {
-            $v = $axes[$axis] ?? 50;
-            $score += ($v - 50) * $w;     // 偏离中位 50 越多、权重符号契合，得分越高
-            $abs_w += abs($w);
-        }
-        // 归一化：理论极值范围 ±50 * abs_w
-        $norm = $abs_w ? ($score / (50 * $abs_w)) : 0;  // -1 .. +1
-        if ($norm > $best_score) {
-            $best_score = $norm;
-            $best = ['name' => $name] + $info;
-        }
-    }
-    if (!$best) return null;
-    // 找出在该战队权重模板下，玩家最契合的 3 个轴（按 (axes[axis]-50)*sign(weight) 排序取前 3）
-    $contrib = [];
-    foreach ($best['weights'] as $axis => $w) {
-        $sign = $w >= 0 ? 1 : -1;
-        $contrib[$axis] = ((($axes[$axis] ?? 50) - 50) * $sign);
-    }
-    arsort($contrib);
-    $best['top_axes'] = array_slice(array_keys($contrib), 0, 3);
-    $best['match_pct'] = max(0, min(100, (int)round(($best_score + 1) * 50)));  // -1..+1 → 0..100
-    return $best;
-}
-
-// 从 hero_judgements 里挑最佳角色演绎者：评分最高且场次≥3
-function pick_best_hero($heroes) {
-    if (!is_array($heroes) || empty($heroes)) return null;
-    $cand = array_filter($heroes, function($h){
-        return ($h['matches'] ?? 0) >= 3 && is_numeric($h['score'] ?? null);
-    });
-    if (empty($cand)) {
-        // 数据少时退而求其次：场次≥1
-        $cand = array_filter($heroes, function($h){ return is_numeric($h['score'] ?? null); });
-    }
-    if (empty($cand)) return null;
-    usort($cand, function($a, $b){ return ($b['score'] ?? 0) <=> ($a['score'] ?? 0); });
-    return $cand[0];
 }
 
 // SVG 六边形雷达图
@@ -751,6 +696,30 @@ function radar_svg($axes) {
 .ai-block li{margin:3px 0;}
 .ai-block strong{color:#e3b341;}
 
+/* OWPA 分类卡片 */
+.owpa-cards{display:flex;flex-direction:column;gap:12px;}
+.owpa-card{background:#0d1117;border:1px solid #30363d;border-left:3px solid #6e7681;border-radius:6px;padding:14px 18px;line-height:1.75;color:#c9d1d9;font-size:14px;}
+.owpa-card .ohead{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.owpa-card .ohead .otag{font-family:"Courier New",monospace;font-size:10px;font-weight:700;letter-spacing:1.5px;padding:2px 7px;border-radius:3px;background:rgba(110,118,129,.15);color:#8b949e;border:1px solid #30363d;}
+.owpa-card .ohead .otitle{font-size:14px;font-weight:700;color:#e6edf3;}
+.owpa-card .obody{color:#c9d1d9;}
+.owpa-card .obody p{margin:5px 0;}
+.owpa-card .obody ul{margin:5px 0;padding-left:20px;}
+.owpa-card .obody li{margin:3px 0;}
+.owpa-card .obody strong{color:#e3b341;}
+/* 五类配色 */
+.owpa-card.kind-core{border-left-color:#3fb950;}
+.owpa-card.kind-core .otag{background:rgba(63,185,80,.12);color:#3fb950;border-color:rgba(63,185,80,.3);}
+.owpa-card.kind-role{border-left-color:#58a6ff;}
+.owpa-card.kind-role .otag{background:rgba(88,166,255,.12);color:#58a6ff;border-color:rgba(88,166,255,.3);}
+.owpa-card.kind-hero{border-left-color:#a78bfa;}
+.owpa-card.kind-hero .otag{background:rgba(167,139,250,.12);color:#a78bfa;border-color:rgba(167,139,250,.3);}
+.owpa-card.kind-dim{border-left-color:#d29922;}
+.owpa-card.kind-dim .otag{background:rgba(210,153,34,.12);color:#d29922;border-color:rgba(210,153,34,.3);}
+.owpa-card.kind-fix{border-left-color:#3fb950;background:linear-gradient(180deg,#0d1117 0%,rgba(63,185,80,.04) 100%);}
+.owpa-card.kind-fix .otag{background:rgba(63,185,80,.18);color:#3fb950;border-color:rgba(63,185,80,.4);}
+.owpa-card.kind-fix .otitle{color:#3fb950;}
+
 .team-card{background:#0d1117;border:1px solid #30363d;border-left:3px solid #58a6ff;border-radius:6px;padding:18px 22px;display:flex;gap:18px;align-items:center;flex-wrap:wrap;}
 .team-info{flex:1;min-width:240px;}
 .team-name{font-size:18px;font-weight:700;color:#58a6ff;margin-bottom:4px;font-family:"Microsoft YaHei",sans-serif;}
@@ -787,7 +756,7 @@ function radar_svg($axes) {
         <?php if ($region === 'intl'): ?>
         ⓘ <b>国际服</b>数据来自 <code>overfast-api.tekrop.fr</code>。仅支持已公开生涯的国际服账号；从国内服务器访问偶尔慢/超时。<br>
         <?php else: ?>
-        ⓘ <b>国服</b>数据来自 <code>owjob.online</code>。生涯需公开。首次查询新账号需后台爬取，可能等待 <b>10–60 秒</b>。<br>
+        ⓘ <b>国服</b>：输入完整 BattleTag（昵称#数字）查询。<br>
         <?php endif; ?>
         ⓘ 同一个 BattleTag + 服务器组合 <b>6 小时内</b>会自动用缓存，秒开。
     </p>
@@ -801,9 +770,9 @@ function radar_svg($axes) {
             <?php foreach ($history_items as $h):
                 $jd = json_decode($h['owjob_data'], true);
                 $h_reg = $h['region'] ?: 'cn';
-                // 国服分数从 owjob 的 score；国际服没有单一总分，用 endorsement level 代显
+                // 国服显示等级；国际服没有单一总分
                 $sc = null;
-                if ($h_reg === 'cn' && isset($jd['score'])) $sc = (int)$jd['score'];
+                if ($h_reg === 'cn' && isset($jd['profile']['level'])) $sc = 'Lv' . (int)$jd['profile']['level'];
                 $is_active = ($cur_hid === (int)$h['id']);
             ?>
             <a href="?hid=<?= (int)$h['id'] ?>" class="ow-history-item<?= $is_active ? ' active' : '' ?>" title="查看这次结果">
@@ -831,103 +800,111 @@ function radar_svg($axes) {
     <?php endif; ?>
 
     <?php if ($data && $region === 'cn'):
-        $score = isset($data['score']) ? (int)$data['score'] : null;
-        $score_cls = $score === null ? '' : ($score >= 60 ? '' : ($score >= 45 ? 'low' : 'bad'));
-        $dq = $data['data_quality'] ?? [];
-        $best_hero = pick_best_hero($data['hero_judgements'] ?? []);
+        $p = $data['profile'] ?? [];
+        $role_cn = ['tank'=>'坦克', 'dps'=>'输出', 'healer'=>'辅助', 'open'=>'自由'];
+        $rank_cn = ['Bronze'=>'青铜','Silver'=>'白银','Gold'=>'黄金','Platinum'=>'铂金','Diamond'=>'钻石','Master'=>'大师','Grandmaster'=>'宗师','Champion'=>'冠军','Ultimate'=>'究极'];
     ?>
+        <script>window.OW_CT = <?= json_encode($p['customerToken'] ?? '', JSON_UNESCAPED_SLASHES) ?>;</script>
         <div class="profile-card">
+            <?php if (!empty($p['icon'])): ?>
+                <img src="<?= htmlspecialchars($p['icon']) ?>" alt="" style="width:64px;height:64px;border-radius:8px;border:1px solid #30363d;background:#0d1117;">
+            <?php endif; ?>
             <div style="flex:1;min-width:200px;">
-                <div class="profile-name"><?= htmlspecialchars($battletag_in) ?></div>
+                <div class="profile-name"><?= htmlspecialchars($p['name'] ?? $battletag_in) ?> <span class="region-tag">国服</span></div>
                 <div class="profile-meta">
-                    模式 <b><?= htmlspecialchars($data['mode_label'] ?? '—') ?></b>
-                    · 样本 <b><?= (int)($data['sample_size'] ?? 0) ?></b> 场
-                    · 数据质量 <b><?= htmlspecialchars($dq['quality_label'] ?? '—') ?></b>
+                    bnetId <b><?= htmlspecialchars((string)($p['bnetId'] ?? '—')) ?></b>
+                    · 赞赏等级 <b><?= htmlspecialchars((string)($p['level'] ?? '—')) ?></b>
+                    · 时长 <b><?= htmlspecialchars((string)($p['gameTime'] ?? '—')) ?></b>h
+                    · 总场次 <b><?= htmlspecialchars((string)($p['totalMatchNum'] ?? '—')) ?></b>
                 </div>
-            </div>
-            <div class="profile-right">
-                <?php if ($best_hero): ?>
-                <div class="hero-badge">
-                    <span class="lab">最佳角色演绎</span>
-                    <span class="hero"><?= htmlspecialchars($best_hero['hero'] ?? '—') ?></span>
-                    <span class="meta"><?= (int)($best_hero['matches'] ?? 0) ?> 场 · 评分 <?= htmlspecialchars((string)($best_hero['score'] ?? '—')) ?></span>
-                </div>
-                <?php endif; ?>
-                <?php if ($score !== null): ?>
-                <div class="score-badge <?= $score_cls ?>">
-                    <span class="lab">综合评分</span>
-                    <span class="num"><?= $score ?></span>
-                </div>
-                <?php endif; ?>
             </div>
         </div>
 
-        <?php if (!empty($data['analysis'])):
-            $radar_axes = build_radar_axes($data['analysis']);
+        <?php $radar = build_radar_ds163($data); if ($radar): ?>
+        <div class="section">
+            <div class="section-head"><h3>六维画像</h3><span class="meta">竞技优先 · 场均数据估算</span></div>
+            <div class="section-body" style="display:flex;justify-content:center;">
+                <div class="radar-wrap" style="border:none;background:transparent;">
+                    <?= radar_svg($radar) ?>
+                    <div class="radar-foot">胜率 / KDA / 击杀 / 生存 / 参团 / 贡献，每轴 0–100，越靠外越好。</div>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <div class="section" style="padding-top:0;">
+        <div class="ow-mode-tabs" style="padding:14px 16px 4px;margin-bottom:0;">
+            <?php $fb=true; foreach (['sport'=>'竞技', 'leisure'=>'快速'] as $mode => $mlbl): if (empty($data[$mode]['guideCountData'])) continue; ?>
+                <button type="button" class="ow-mtab<?= $fb ? ' active' : '' ?>" data-pane="owpane-<?= $mode ?>"><?= $mlbl ?></button>
+            <?php $fb=false; endforeach; ?>
+        </div>
+        <?php $fb=true; foreach (['sport'=>'竞技', 'leisure'=>'快速'] as $mode => $mlbl):
+            $md = $data[$mode] ?? null;
+            if (!is_array($md) || empty($md['guideCountData'])) continue;
+            $sum = $md['presetsSummaryData'] ?? [];
         ?>
-        <div class="section">
-            <div class="section-head">
-                <h3>量化指标</h3>
-                <span class="meta">来源 owjob.online</span>
-            </div>
+        <div class="owpane" id="owpane-<?= $mode ?>"<?= $fb ? '' : ' style="display:none;"' ?>>
             <div class="section-body">
-                <div class="analysis-grid">
-                    <div class="kpi-grid">
-                        <?php foreach ($data['analysis'] as $a):
-                            $info = analyze_label($a['label'] ?? '');
-                        ?>
-                        <div class="kpi">
-                            <div class="kpi-label"><?= htmlspecialchars($info['core'] ?: ($a['label'] ?? '—')) ?></div>
-                            <div class="kpi-value"><?= htmlspecialchars((string)($a['value'] ?? '—')) ?></div>
-                            <?php if (!empty($info['hint'])): ?>
-                            <div class="kpi-hint"><?= htmlspecialchars($info['hint']) ?></div>
-                            <?php endif; ?>
-                        </div>
-                        <?php endforeach; ?>
-                        <?php if (isset($data['low_contribution_share'])): ?>
-                        <div class="kpi">
-                            <div class="kpi-label">低贡献场次占比</div>
-                            <div class="kpi-value"><?= fmt_pct($data['low_contribution_share']) ?></div>
-                            <div class="kpi-hint">团战贡献低于队友均值的对局占比，越高越爱划水</div>
-                        </div>
-                        <?php endif; ?>
-                    </div>
-                    <div class="radar-wrap">
-                        <div class="radar-title">六维画像</div>
-                        <?= radar_svg($radar_axes) ?>
-                        <div class="radar-foot">每轴 0–100，越靠外越好。<br>缺省维度按中位 50 显示。</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <?php endif; ?>
-
-        <?php if (!empty($data['hero_judgements'])): ?>
-        <div class="section">
-            <div class="section-head"><h3>常用英雄</h3></div>
-            <div class="section-body" style="overflow-x:auto;">
-                <table class="hero-table">
-                    <thead><tr><th>英雄</th><th>模式</th><th>场次</th><th>占比</th><th>评分</th><th>状态</th></tr></thead>
-                    <tbody>
-                    <?php foreach ($data['hero_judgements'] as $h):
-                        $st = (string)($h['state'] ?? '');
-                        $cls = (mb_strpos($st, '不背') !== false || mb_strpos($st, '稳') !== false) ? '' :
-                               ((mb_strpos($st, '背锅') !== false || mb_strpos($st, '烂') !== false) ? 'bad' : 'warn');
+                <div class="kpi-grid">
+                    <?php foreach ((array)$md['guideCountData'] as $g):
+                        $rk = $g['lastRankInfo']['rankName'] ?? 'None';
+                        $rank_txt = ($rk === 'None' || $rk === '') ? '未定级' : (($rank_cn[$rk] ?? $rk) . ' ' . ($g['lastRankInfo']['rankSubTier'] ?? ''));
                     ?>
-                        <tr>
-                            <td class="hero-name"><?= htmlspecialchars($h['hero'] ?? '—') ?></td>
-                            <td><?= htmlspecialchars($h['mode'] ?? '—') ?></td>
-                            <td><?= (int)($h['matches'] ?? 0) ?></td>
-                            <td><?= fmt_pct($h['share'] ?? null) ?></td>
-                            <td><?= htmlspecialchars((string)($h['score'] ?? '—')) ?></td>
-                            <td><span class="hero-state <?= $cls ?>"><?= htmlspecialchars($st ?: '—') ?></span></td>
-                        </tr>
+                    <div class="kpi">
+                        <div class="kpi-label"><?= htmlspecialchars($role_cn[$g['roleType'] ?? ''] ?? ($g['roleType'] ?? '?')) ?><?php if ($rank_txt !== '未定级'): ?> · <?= htmlspecialchars($rank_txt) ?><?php endif; ?></div>
+                        <div class="kpi-value"><?= htmlspecialchars((string)($g['winRate'] ?? '—')) ?>%</div>
+                        <div class="kpi-hint"><?= (int)($g['matchSum'] ?? 0) ?> 场 · KDA <?= htmlspecialchars((string)($g['kda'] ?? '—')) ?> · 最高 <?= (int)($g['maxWinStreak'] ?? 0) ?> 连胜</div>
+                    </div>
                     <?php endforeach; ?>
-                    </tbody>
-                </table>
+                </div>
+                <?php if ($sum): ?>
+                <div class="kpi-grid" style="margin-top:10px;">
+                    <div class="kpi"><div class="kpi-label">场均击杀</div><div class="kpi-value"><?= htmlspecialchars((string)($sum['aveKill'] ?? '—')) ?></div></div>
+                    <div class="kpi"><div class="kpi-label">场均死亡</div><div class="kpi-value"><?= htmlspecialchars((string)($sum['aveDeath'] ?? '—')) ?></div></div>
+                    <div class="kpi"><div class="kpi-label">场均助攻</div><div class="kpi-value"><?= htmlspecialchars((string)($sum['aveAssist'] ?? '—')) ?></div></div>
+                    <div class="kpi"><div class="kpi-label">场均伤害</div><div class="kpi-value" style="font-size:18px;"><?= htmlspecialchars((string)($sum['aveHeroDamage'] ?? '—')) ?></div></div>
+                    <div class="kpi"><div class="kpi-label">场均治疗</div><div class="kpi-value" style="font-size:18px;"><?= htmlspecialchars((string)($sum['aveCure'] ?? '—')) ?></div></div>
+                    <div class="kpi"><div class="kpi-label">场均承伤</div><div class="kpi-value" style="font-size:18px;"><?= htmlspecialchars((string)($sum['aveResistDamage'] ?? '—')) ?></div></div>
+                </div>
+                <?php endif; ?>
+                <?php if (!empty($md['matchList'])):
+                    $mlist  = (array)$md['matchList'];
+                    $mcount = count($mlist);
+                    $tbl_id = 'ml-' . $mode;
+                ?>
+                <div class="section-head" style="border:none;padding:14px 0 6px;">
+                    <h3>对局记录（<?= $mcount ?> 场）</h3>
+                    <?php if ($mcount > 10): ?><span class="meta"><a href="javascript:;" class="ml-toggle" data-tbl="<?= $tbl_id ?>" style="color:#58a6ff;text-decoration:none;">展开全部 ▾</a></span><?php endif; ?>
+                </div>
+                <div style="overflow-x:auto;">
+                    <table class="hero-table">
+                        <thead><tr><th>英雄</th><th>位置</th><th>结果</th><th>比分</th><th>K/D/A</th><th>伤害</th><th>治疗</th><th>承伤</th><th>时间</th><th>详情</th></tr></thead>
+                        <tbody>
+                        <?php foreach ($mlist as $idx => $mt):
+                            $win = ($mt['matchRet'] ?? 0) > 0;
+                            $ts  = !empty($mt['beginTs']) ? date('m-d H:i', (int)round($mt['beginTs'] / 1000)) : '—';
+                        ?>
+                            <tr class="<?= $tbl_id ?>-row"<?= $idx >= 10 ? ' style="display:none;"' : '' ?>>
+                                <td><?php if (!empty($mt['heroIcon'])): ?><img src="<?= htmlspecialchars($mt['heroIcon']) ?>" alt="" style="width:26px;height:26px;border-radius:4px;vertical-align:middle;background:#0d1117;"><?php endif; ?></td>
+                                <td><?= htmlspecialchars($role_cn[$mt['roleType'] ?? ''] ?? '—') ?></td>
+                                <td><span class="hero-state <?= $win ? '' : 'bad' ?>"><?= $win ? '胜' : '负' ?></span></td>
+                                <td><?= (int)($mt['teamScore'] ?? 0) ?>:<?= (int)($mt['opponentScore'] ?? 0) ?></td>
+                                <td><?= (int)($mt['kill'] ?? 0) ?>/<?= (int)($mt['death'] ?? 0) ?>/<?= (int)($mt['assist'] ?? 0) ?></td>
+                                <td><?= (int)($mt['heroDamage'] ?? 0) ?></td>
+                                <td><?= (int)($mt['cure'] ?? 0) ?></td>
+                                <td><?= (int)($mt['resistDamage'] ?? 0) ?></td>
+                                <td style="color:#6e7681;"><?= $ts ?></td>
+                                <td><?php if (!empty($mt['matchId'])): ?><a href="javascript:;" class="ow-md-btn" data-mid="<?= htmlspecialchars($mt['matchId']) ?>" style="color:#58a6ff;text-decoration:none;">查看</a><?php endif; ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php endif; ?>
             </div>
         </div>
-        <?php endif; ?>
+        <?php $fb=false; endforeach; ?>
+        </div><!-- /mode section -->
     <?php endif; /* end region===cn render */ ?>
 
     <?php if ($data && $region === 'intl'):
@@ -1018,6 +995,7 @@ function radar_svg($axes) {
     <?php endif; /* end region===intl render */ ?>
 
     <?php if ($advice): ?>
+        <?php $owpa_sections = parse_owpa_sections($advice); ?>
         <div class="section">
             <div class="section-head">
                 <h3>DeepSeek 教练分析</h3>
@@ -1026,58 +1004,180 @@ function radar_svg($axes) {
                 <?php endif; ?>
             </div>
             <div class="section-body">
-                <div class="ai-block"><?= mini_md($advice) ?></div>
+                <?php if (count($owpa_sections) <= 1 && empty($owpa_sections[0]['title'])): ?>
+                    <div class="ai-block"><?= mini_md($advice) ?></div>
+                <?php else: ?>
+                    <div class="owpa-cards">
+                        <?php foreach ($owpa_sections as $sec):
+                            $kind  = owpa_section_kind($sec['title']);
+                            $title = $sec['title'] ?: '其它';
+                        ?>
+                            <div class="owpa-card kind-<?= $kind ?>">
+                                <div class="ohead">
+                                    <span class="otag"><?= htmlspecialchars(strtoupper($kind)) ?></span>
+                                    <span class="otitle"><?= htmlspecialchars($title) ?></span>
+                                </div>
+                                <div class="obody"><?= mini_md($sec['body']) ?></div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
             </div>
         </div>
     <?php elseif ($ds_error): ?>
         <div class="ow-error">⚠ <?= htmlspecialchars($ds_error) ?></div>
     <?php endif; ?>
 
-    <?php
-        if ($data && $region === 'cn' && !empty($data['analysis'])):
-            $team = match_team($radar_axes ?? build_radar_axes($data['analysis']));
-            if ($team):
+    <?php if ($data && $region === 'cn' && ($radar_owl = build_radar_ds163($data))):
+        $owl = match_owl($radar_owl, ds163_main_role($data));
+        $tm = $owl['team']; $pl = $owl['player'];
     ?>
-        <div class="section">
-            <div class="section-head"><h3>适合你的战队</h3></div>
-            <div class="section-body">
-                <div class="team-card">
-                    <div class="team-info">
-                        <div class="team-name"><?= htmlspecialchars($team['name']) ?></div>
-                        <div class="team-tagline"><?= htmlspecialchars($team['tagline']) ?></div>
-                        <p class="team-desc"><?= htmlspecialchars($team['desc']) ?></p>
-                        <div class="team-axes">
-                            <?php foreach ($team['top_axes'] as $ax): ?>
-                                <span class="ax"><?= htmlspecialchars($ax) ?> <?= (int)round($radar_axes[$ax] ?? 50) ?></span>
-                            <?php endforeach; ?>
-                        </div>
-                    </div>
-                    <div class="team-match">
-                        <span class="lab">契合度</span>
-                        <span class="num"><?= $team['match_pct'] ?></span>
-                        <span class="sub">/ 100</span>
-                    </div>
+    <div class="section">
+        <div class="section-head"><h3>你适合的 OWL 战队 &amp; 选手</h3><span class="meta">基于六维画像匹配</span></div>
+        <div class="section-body">
+            <?php if ($tm): ?>
+            <div class="team-card">
+                <div class="team-info">
+                    <div class="team-name"><?= htmlspecialchars($tm['name']) ?></div>
+                    <div class="team-tagline"><?= htmlspecialchars($tm['tagline']) ?></div>
+                    <p class="team-desc"><?= htmlspecialchars($tm['desc']) ?></p>
+                </div>
+                <div class="team-match">
+                    <span class="lab">战队契合</span>
+                    <span class="num"><?= $tm['match_pct'] ?></span>
+                    <span class="sub">/ 100</span>
                 </div>
             </div>
+            <?php endif; ?>
+            <?php if ($pl): ?>
+            <div class="team-card" style="border-left-color:#e3b341;margin-top:12px;">
+                <div class="team-info">
+                    <div class="team-name" style="color:#e3b341;"><?= htmlspecialchars($pl['name']) ?></div>
+                    <div class="team-tagline"><?= htmlspecialchars($pl['tag']) ?></div>
+                    <p class="team-desc"><?= htmlspecialchars($pl['desc']) ?></p>
+                </div>
+                <div class="team-match">
+                    <span class="lab">选手神似</span>
+                    <span class="num" style="color:#e3b341;"><?= $pl['match_pct'] ?></span>
+                    <span class="sub">/ 100</span>
+                </div>
+            </div>
+            <?php endif; ?>
         </div>
-    <?php endif; endif; ?>
+    </div>
+    <?php endif; ?>
 
     <?php if ($data || $error): ?>
     <div class="ow-foot">
         <?php if ($region === 'intl'): ?>
         战绩数据 · <a href="https://overfast-api.tekrop.fr" target="_blank" rel="noopener">overfast-api.tekrop.fr</a>　|　教练分析 · DeepSeek
         <?php else: ?>
-        战绩数据 · <a href="https://owjob.online" target="_blank" rel="noopener">owjob.online</a>　|　教练分析 · DeepSeek
+        教练分析 · DeepSeek
         <?php endif; ?>
     </div>
     <?php endif; ?>
 </div>
 
+<!-- 查询进度条 -->
+<div id="ow-progress" style="display:none;position:fixed;inset:0;background:rgba(13,17,23,.94);z-index:10000;flex-direction:column;align-items:center;justify-content:center;">
+  <div style="color:#3fb950;font-family:'Courier New',monospace;font-size:14px;margin-bottom:14px;letter-spacing:1px;">// 正在查询战绩…</div>
+  <div style="width:280px;height:6px;background:#21262d;border-radius:3px;overflow:hidden;">
+    <div id="ow-progress-bar" style="width:0;height:100%;background:#3fb950;transition:width .25s ease;"></div>
+  </div>
+</div>
+
+<!-- 单场详情弹窗 -->
+<div id="ow-md-mask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 16px;">
+  <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;max-width:780px;width:100%;padding:18px;position:relative;">
+    <a href="javascript:;" id="ow-md-close" style="position:absolute;top:10px;right:16px;color:#8b949e;text-decoration:none;font-size:18px;">✕</a>
+    <div id="ow-md-body" style="color:#c9d1d9;font-family:'Courier New',monospace;font-size:13px;">加载中…</div>
+  </div>
+</div>
+<style>
+#ow-md-body .md-err{color:#f85149;padding:10px;}
+#ow-md-body .md-head{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
+#ow-md-body .md-map{font-weight:700;color:#e6edf3;font-size:16px;}
+#ow-md-body .md-mode{color:#8b949e;font-size:12px;}
+#ow-md-body .md-result{padding:1px 8px;border-radius:3px;font-weight:700;}
+#ow-md-body .md-result.win{background:rgba(63,185,80,.15);color:#3fb950;}
+#ow-md-body .md-result.lose{background:rgba(248,81,73,.15);color:#f85149;}
+#ow-md-body .md-score{color:#e3b341;font-weight:700;}
+#ow-md-body .md-dur{color:#6e7681;font-size:12px;}
+#ow-md-body .md-team-title{font-size:12px;font-weight:700;letter-spacing:1px;margin:12px 0 6px;}
+#ow-md-body .md-team-title.md-ally{color:#3fb950;}
+#ow-md-body .md-team-title.md-enemy{color:#f85149;}
+#ow-md-body .md-table{width:100%;border-collapse:collapse;font-size:12px;}
+#ow-md-body .md-table th,#ow-md-body .md-table td{padding:5px 8px;border-bottom:1px solid #21262d;text-align:left;white-space:nowrap;}
+#ow-md-body .md-table th{color:#6e7681;font-size:11px;}
+#ow-md-body .md-hero{display:flex;align-items:center;gap:6px;}
+#ow-md-body .md-hero img{width:24px;height:24px;border-radius:4px;}
+#ow-md-body .md-name{color:#e6edf3;font-family:"Microsoft YaHei",sans-serif;}
+#ow-md-body .md-rank{color:#e3b341;}
+#ow-md-body .md-bans{display:flex;gap:24px;margin-top:14px;flex-wrap:wrap;}
+#ow-md-body .md-bans img{width:24px;height:24px;border-radius:4px;margin-right:4px;filter:grayscale(1) brightness(.6);}
+#ow-md-body .md-ban-label{color:#6e7681;font-size:11px;margin-right:8px;}
+#ow-md-body .md-prow{cursor:pointer;}
+#ow-md-body .md-prow:hover{background:#1c2128;}
+#ow-md-body .md-pdetail td{background:#010409;color:#8b949e;font-size:11px;padding:6px 10px;}
+#ow-md-body .md-pdetail b{color:#e3b341;}
+.ow-mode-tabs{display:flex;gap:8px;margin-bottom:12px;}
+.ow-mtab{background:#161b22;border:1px solid #30363d;color:#8b949e;padding:7px 22px;border-radius:6px;cursor:pointer;font-family:"Courier New",monospace;font-size:13px;font-weight:700;transition:.15s;}
+.ow-mtab:hover{color:#e6edf3;border-color:#3fb950;}
+.ow-mtab.active{background:#3fb950;color:#0d1117;border-color:#3fb950;}
+</style>
+
 <script>
 // 提交时禁用按钮防重复
 document.getElementById('ow-form').addEventListener('submit', function(){
     var b = document.getElementById('ow-btn');
-    b.disabled = true; b.textContent = '查询中（可能 10-60 秒）…';
+    b.disabled = true; b.textContent = '查询中…';
+    var p=document.getElementById('ow-progress'), bar=document.getElementById('ow-progress-bar');
+    if(p && bar){ p.style.display='flex'; var w=8; bar.style.width='8%';
+        var t=setInterval(function(){ w+=Math.random()*11; if(w>=92){w=92;clearInterval(t);} bar.style.width=w+'%'; },220);
+    }
+});
+// 对局记录「展开全部 / 收起」
+document.querySelectorAll('.ml-toggle').forEach(function(a){
+    a.addEventListener('click', function(){
+        var rows = document.querySelectorAll('.' + a.dataset.tbl + '-row');
+        var expand = a.textContent.indexOf('展开') >= 0;
+        rows.forEach(function(r, i){ if (i >= 10) r.style.display = expand ? '' : 'none'; });
+        a.textContent = expand ? '收起 ▴' : '展开全部 ▾';
+    });
+});
+// 单场详情弹窗
+(function(){
+    var mask=document.getElementById('ow-md-mask'), body=document.getElementById('ow-md-body');
+    if(!mask) return;
+    function close(){ mask.style.display='none'; }
+    var cb=document.getElementById('ow-md-close'); if(cb) cb.addEventListener('click',close);
+    mask.addEventListener('click',function(e){ if(e.target===mask) close(); });
+    // 点击玩家行展开/收起更详细数据
+    body.addEventListener('click',function(e){
+        var row=e.target.closest('.md-prow');
+        if(row){ var d=row.nextElementSibling; if(d&&d.classList.contains('md-pdetail')) d.style.display=(d.style.display==='none'?'':'none'); }
+    });
+    document.querySelectorAll('.ow-md-btn').forEach(function(b){
+        b.addEventListener('click',function(){
+            var mid=b.dataset.mid, ct=window.OW_CT||'';
+            if(!ct){ alert('缺 customerToken，请重新查询'); return; }
+            body.innerHTML='加载中…'; mask.style.display='flex';
+            var fd=new FormData(); fd.append('matchId',mid); fd.append('customerToken',ct);
+            fetch('../actions/ow_ds163_match.php',{method:'POST',body:fd,credentials:'same-origin'})
+                .then(function(r){return r.text();})
+                .then(function(html){ body.innerHTML=html; })
+                .catch(function(){ body.innerHTML='<div class="md-err">请求失败</div>'; });
+        });
+    });
+})();
+// 竞技/快速 模式 TAB 切换
+document.querySelectorAll('.ow-mtab').forEach(function(t){
+    t.addEventListener('click',function(){
+        document.querySelectorAll('.ow-mtab').forEach(function(x){x.classList.remove('active');});
+        t.classList.add('active');
+        document.querySelectorAll('.owpane').forEach(function(p){p.style.display='none';});
+        var pane=document.getElementById(t.dataset.pane); if(pane) pane.style.display='';
+    });
 });
 </script>
 </body>

@@ -16,10 +16,14 @@ if (!$is_admin_or_owner && !$can_msg && !$is_cs) {
 require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../includes/exp_helper.php';
 require_once __DIR__ . '/../includes/site_settings.php';
+require_once __DIR__ . '/../includes/cocktail_helper.php';
+require_once __DIR__ . '/../includes/sidebar_helper.php';
 
 $conn->set_charset('utf8mb4');
 ensure_user_columns($conn);
 ensure_decoration_tables($conn);
+ensure_cocktail_tables($conn);
+ensure_sidebar_tables($conn);
 if (function_exists('ensure_song_sheets_table')) ensure_song_sheets_table($conn);
 
 $my_id   = intval($_SESSION['user_id']);
@@ -33,7 +37,7 @@ else                         $default_tab = 'cs';
 $tab = $_GET['tab'] ?? $default_tab;
 
 // tab 访问控制
-$admin_only_tabs   = ['posts','reports','bans','categories','activities','carousel','profile_reviews','sheets','comments','decorations'];
+$admin_only_tabs   = ['posts','reports','bans','categories','activities','carousel','profile_reviews','sheets','comments','decorations','cocktails','sidebar'];
 $messages_tabs     = ['messages'];
 $cs_tabs           = ['cs'];
 $owner_only_tabs   = ['ai'];
@@ -57,6 +61,18 @@ if ($tab === 'ai' && $is_owner && $_SERVER['REQUEST_METHOD'] === 'POST' && isset
     }
     if (!empty($_POST['clear_key'])) set_setting($conn, 'deepseek_api_key', '');
     header("Location: admin.php?tab=ai&ai_msg=saved"); exit;
+}
+
+// ── 守望国服（网易大神 ds163）凭证保存（仅 owner） ──
+if ($tab === 'ai' && $is_owner && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_owcn'])) {
+    foreach (['ow_ds163_roleid','ow_ds163_uid','ow_ds163_deviceid','ow_ds163_dts','ow_ds163_server','ow_ds163_xsrf','ow_ds163_ntes_sess'] as $k) {
+        if (isset($_POST[$k])) set_setting($conn, $k, trim($_POST[$k]));
+    }
+    // token 敏感：留空表示不修改（避免被打码字符串覆盖）
+    $owtok = $_POST['ow_ds163_token'] ?? '';
+    if ($owtok !== '' && strpos($owtok, '•') === false) set_setting($conn, 'ow_ds163_token', trim($owtok));
+    if (!empty($_POST['ow_clear_token'])) set_setting($conn, 'ow_ds163_token', '');
+    header("Location: admin.php?tab=ai&ai_msg=owcn_saved"); exit;
 }
 
 // ── 帖子操作 ──
@@ -135,6 +151,38 @@ if ($is_admin_or_owner && $tab === 'categories') {
             }
         }
     }
+}
+
+// ── 左侧侧边栏管理 ──
+if ($is_admin_or_owner && $tab === 'sidebar' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $sb_act = $_POST['sb_action'] ?? '';
+    if ($sb_act === 'add_group') {
+        $n = $conn->real_escape_string(mb_substr(trim($_POST['gname'] ?? ''), 0, 50));
+        if ($n !== '') {
+            $mo = (int)($conn->query("SELECT COALESCE(MAX(sort_order),-1)+1 m FROM sidebar_groups")->fetch_assoc()['m'] ?? 0);
+            $conn->query("INSERT INTO sidebar_groups (name, sort_order) VALUES ('$n', $mo)");
+        }
+    } elseif ($sb_act === 'rename_group') {
+        $gid = (int)($_POST['gid'] ?? 0);
+        $n = $conn->real_escape_string(mb_substr(trim($_POST['gname'] ?? ''), 0, 50));
+        if ($gid && $n !== '') $conn->query("UPDATE sidebar_groups SET name='$n' WHERE id=$gid");
+    } elseif ($sb_act === 'del_group') {
+        $gid = (int)($_POST['gid'] ?? 0);
+        if ($gid) { $conn->query("DELETE FROM sidebar_groups WHERE id=$gid"); $conn->query("DELETE FROM sidebar_links WHERE group_id=$gid"); }
+    } elseif ($sb_act === 'add_link') {
+        $gid = (int)($_POST['gid'] ?? 0);
+        $lb = $conn->real_escape_string(mb_substr(trim($_POST['label'] ?? ''), 0, 50));
+        $u  = $conn->real_escape_string(mb_substr(trim($_POST['url'] ?? ''), 0, 255));
+        $ic = $conn->real_escape_string(mb_substr(trim($_POST['icon'] ?? ''), 0, 10));
+        if ($gid && $lb !== '' && $u !== '') {
+            $mo = (int)($conn->query("SELECT COALESCE(MAX(sort_order),-1)+1 m FROM sidebar_links WHERE group_id=$gid")->fetch_assoc()['m'] ?? 0);
+            $conn->query("INSERT INTO sidebar_links (group_id, label, url, icon, sort_order) VALUES ($gid, '$lb', '$u', '$ic', $mo)");
+        }
+    } elseif ($sb_act === 'del_link') {
+        $lid = (int)($_POST['lid'] ?? 0);
+        if ($lid) $conn->query("DELETE FROM sidebar_links WHERE id=$lid");
+    }
+    header("Location: admin.php?tab=sidebar&sb_msg=ok"); exit;
 }
 
 // ── 站内活动（首页轮播）──
@@ -234,6 +282,202 @@ if ($is_admin_or_owner && $tab === 'carousel') {
     }
     $cr = $conn->query("SELECT * FROM site_activities ORDER BY sort_order ASC, id DESC");
     if ($cr) while ($r = $cr->fetch_assoc()) $carousel_items[] = $r;
+}
+
+// ── 调酒：食材 + 鸡尾酒 ──
+$ck_msg = $_GET['ck_msg'] ?? '';
+$ck_sub = $_GET['sub'] ?? 'cocktails';
+if (!in_array($ck_sub, ['ingredients','cocktails'])) $ck_sub = 'cocktails';
+$ingredient_types = cocktail_ingredient_types();
+$cocktail_methods_map = cocktail_methods();
+$ck_edit_cocktail = null;
+$all_ingredients = [];
+$all_cocktails   = [];
+$ck_form_err = '';
+
+if ($is_admin_or_owner && $tab === 'cocktails') {
+    // ── 食材操作 ──
+    if ($ck_sub === 'ingredients') {
+        if (isset($_GET['delete_ing'])) {
+            $iid = intval($_GET['delete_ing']);
+            $conn->query("DELETE FROM cocktail_ingredients WHERE ingredient_id=$iid");
+            $conn->query("DELETE FROM ingredients WHERE id=$iid");
+            header("Location: admin.php?tab=cocktails&sub=ingredients&ck_msg=ing_del"); exit;
+        }
+        if (isset($_GET['toggle_ing'])) {
+            $iid = intval($_GET['toggle_ing']);
+            $conn->query("UPDATE ingredients SET is_active=1-is_active WHERE id=$iid");
+            header("Location: admin.php?tab=cocktails&sub=ingredients&ck_msg=ing_toggle"); exit;
+        }
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ing_form'])) {
+            $iname  = mb_substr(trim($_POST['ing_name'] ?? ''), 0, 50);
+            $itype  = $_POST['ing_type'] ?? 'other';
+            if (!isset($ingredient_types[$itype])) $itype = 'other';
+            $isort  = intval($_POST['ing_sort'] ?? 0);
+            $iactive = isset($_POST['ing_active']) ? 1 : 0;
+            $iedit  = intval($_POST['ing_edit_id'] ?? 0);
+            if ($iname === '') { $ck_form_err = '食材名称不能为空'; }
+            else {
+                $sn = $conn->real_escape_string($iname);
+                $st = $conn->real_escape_string($itype);
+                if ($iedit > 0) {
+                    $conn->query("UPDATE ingredients SET name='$sn', type='$st', sort_order=$isort, is_active=$iactive WHERE id=$iedit");
+                    header("Location: admin.php?tab=cocktails&sub=ingredients&ck_msg=ing_edit"); exit;
+                } else {
+                    $ok = @$conn->query("INSERT INTO ingredients (name, type, sort_order, is_active) VALUES ('$sn', '$st', $isort, $iactive)");
+                    if (!$ok) { $ck_form_err = '食材名称重复或写入失败'; }
+                    else { header("Location: admin.php?tab=cocktails&sub=ingredients&ck_msg=ing_new"); exit; }
+                }
+            }
+        }
+    }
+
+    // ── 鸡尾酒操作 ──
+    if ($ck_sub === 'cocktails') {
+        if (isset($_GET['delete_ck'])) {
+            $cid = intval($_GET['delete_ck']);
+            $row = $conn->query("SELECT image FROM cocktails WHERE id=$cid")->fetch_assoc();
+            if ($row && !empty($row['image'])) {
+                $p = __DIR__ . '/../' . $row['image']; if (file_exists($p)) @unlink($p);
+            }
+            $conn->query("DELETE FROM cocktail_ingredients WHERE cocktail_id=$cid");
+            $conn->query("DELETE FROM cocktail_steps WHERE cocktail_id=$cid");
+            $conn->query("DELETE FROM cocktails WHERE id=$cid");
+            header("Location: admin.php?tab=cocktails&sub=cocktails&ck_msg=ck_del"); exit;
+        }
+        if (isset($_GET['toggle_ck'])) {
+            $cid = intval($_GET['toggle_ck']);
+            $conn->query("UPDATE cocktails SET is_active=1-is_active WHERE id=$cid");
+            header("Location: admin.php?tab=cocktails&sub=cocktails&ck_msg=ck_toggle"); exit;
+        }
+        if (isset($_GET['edit_ck']) && is_numeric($_GET['edit_ck'])) {
+            $cid = (int)$_GET['edit_ck'];
+            $r = $conn->query("SELECT * FROM cocktails WHERE id=$cid");
+            $ck_edit_cocktail = ($r && $r->num_rows > 0) ? $r->fetch_assoc() : null;
+            if ($ck_edit_cocktail) {
+                $ir = $conn->query("SELECT ingredient_id, amount FROM cocktail_ingredients WHERE cocktail_id=$cid ORDER BY sort_order ASC, ingredient_id ASC");
+                $ck_edit_cocktail['ings'] = [];
+                if ($ir) while ($row = $ir->fetch_assoc()) $ck_edit_cocktail['ings'][] = $row;
+                $sr = $conn->query("SELECT content FROM cocktail_steps WHERE cocktail_id=$cid ORDER BY step_order ASC");
+                $ck_edit_cocktail['steps'] = [];
+                if ($sr) while ($row = $sr->fetch_assoc()) $ck_edit_cocktail['steps'][] = $row['content'];
+            }
+        }
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ck_form'])) {
+            $cname   = mb_substr(trim($_POST['ck_name'] ?? ''), 0, 80);
+            $cen     = mb_substr(trim($_POST['ck_name_en'] ?? ''), 0, 80);
+            $g_type  = trim($_POST['ck_glass_type'] ?? '');
+            $g_ml    = preg_replace('/[^\d.]/', '', $_POST['ck_glass_ml'] ?? '');
+            $cglass  = mb_substr(trim($g_type . ($g_ml !== '' ? '（' . $g_ml . 'ml）' : '')), 0, 40);
+            $cmethod = $_POST['ck_method'] ?? 'shake';
+            if (!isset($cocktail_methods_map[$cmethod])) $cmethod = 'shake';
+            $cgarn   = mb_substr(trim($_POST['ck_garnish'] ?? ''), 0, 120);
+            $a_preset = trim($_POST['ck_abv_preset'] ?? '');
+            $a_num    = preg_replace('/[^\d.]/', '', $_POST['ck_abv_num'] ?? '');
+            $cabv    = mb_substr(trim($a_preset . ($a_num !== '' ? ' ' . $a_num . '%' : '')), 0, 20);
+            $csort   = intval($_POST['ck_sort'] ?? 0);
+            $cactive = isset($_POST['ck_active']) ? 1 : 0;
+            $cedit   = intval($_POST['ck_edit_id'] ?? 0);
+            $ing_ids = $_POST['ck_ing_id']     ?? [];
+            $ing_num  = $_POST['ck_ing_num']  ?? [];
+            $ing_unit = $_POST['ck_ing_unit'] ?? [];
+            $steps_in = $_POST['ck_step']      ?? [];
+
+            // 步骤：过滤空行
+            $steps_clean = [];
+            if (is_array($steps_in)) {
+                foreach ($steps_in as $s) {
+                    $s = mb_substr(trim((string)$s), 0, 500);
+                    if ($s !== '') $steps_clean[] = $s;
+                }
+            }
+
+            // 重名检查（排除当前编辑项）
+            if (!$ck_form_err && $cname !== '') {
+                $nm_chk = $conn->real_escape_string($cname);
+                $dup = $conn->query("SELECT id FROM cocktails WHERE name='$nm_chk' AND id!=$cedit LIMIT 1");
+                if ($dup && $dup->num_rows > 0) $ck_form_err = '已有同名配方「' . $cname . '」，换个名字吧';
+            }
+
+            if ($cname === '')         $ck_form_err = '鸡尾酒名称不能为空';
+            if (!$steps_clean)         $ck_form_err = '至少添加一个调制步骤';
+
+            // 图片处理
+            $img_path = '';
+            if (!$ck_form_err && !empty($_FILES['ck_image']['name'])) {
+                $f = $_FILES['ck_image'];
+                $allowed = ['image/jpeg','image/png','image/gif','image/webp'];
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                $mime = finfo_file($finfo, $f['tmp_name']); finfo_close($finfo);
+                if ($f['error'] === UPLOAD_ERR_OK && in_array($mime, $allowed) && $f['size'] <= 5*1024*1024) {
+                    $dir = __DIR__ . '/../uploads/cocktails/';
+                    if (!is_dir($dir)) mkdir($dir, 0755, true);
+                    $ext = strtolower(pathinfo($f['name'], PATHINFO_EXTENSION)) ?: 'jpg';
+                    $fname = 'ck_' . date('Ymd') . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
+                    if (move_uploaded_file($f['tmp_name'], $dir.$fname)) {
+                        $img_path = 'uploads/cocktails/'.$fname;
+                    }
+                } else {
+                    $ck_form_err = '图片格式不支持（JPG/PNG/GIF/WEBP）或超过 5MB';
+                }
+            }
+
+            if (!$ck_form_err) {
+                $sn  = $conn->real_escape_string($cname);
+                $sen = $conn->real_escape_string($cen);
+                $sg  = $conn->real_escape_string($cglass);
+                $sm  = $conn->real_escape_string($cmethod);
+                $sga = $conn->real_escape_string($cgarn);
+                $sa  = $conn->real_escape_string($cabv);
+                $cid_use = 0;
+                if ($cedit > 0) {
+                    $img_sql = '';
+                    if ($img_path !== '') {
+                        $old = $conn->query("SELECT image FROM cocktails WHERE id=$cedit")->fetch_assoc();
+                        if ($old && !empty($old['image'])) {
+                            $op = __DIR__.'/../'.$old['image']; if (file_exists($op)) @unlink($op);
+                        }
+                        $img_sql = ", image='".$conn->real_escape_string($img_path)."'";
+                    }
+                    $conn->query("UPDATE cocktails SET name='$sn', name_en='$sen', glass='$sg', method='$sm', garnish='$sga', abv_hint='$sa', sort_order=$csort, is_active=$cactive$img_sql WHERE id=$cedit");
+                    $cid_use = $cedit;
+                } else {
+                    $si_img = $conn->real_escape_string($img_path);
+                    $conn->query("INSERT INTO cocktails (name, name_en, glass, method, instructions, garnish, image, abv_hint, sort_order, is_active) VALUES ('$sn','$sen','$sg','$sm','','$sga','$si_img','$sa',$csort,$cactive)");
+                    $cid_use = (int)$conn->insert_id;
+                }
+                // 重建材料关联
+                if ($cid_use > 0) {
+                    $conn->query("DELETE FROM cocktail_ingredients WHERE cocktail_id=$cid_use");
+                    if (is_array($ing_ids)) {
+                        $seen = [];
+                        foreach ($ing_ids as $idx => $iid) {
+                            $iid = (int)$iid;
+                            if ($iid <= 0 || isset($seen[$iid])) continue;
+                            $seen[$iid] = 1;
+                            $amt = mb_substr(trim((string)(($ing_num[$idx] ?? '') . ($ing_unit[$idx] ?? ''))), 0, 40);
+                            $sa2 = $conn->real_escape_string($amt);
+                            $conn->query("INSERT INTO cocktail_ingredients (cocktail_id, ingredient_id, amount, sort_order) VALUES ($cid_use, $iid, '$sa2', $idx)");
+                        }
+                    }
+                    // 重建步骤
+                    $conn->query("DELETE FROM cocktail_steps WHERE cocktail_id=$cid_use");
+                    foreach ($steps_clean as $i => $s) {
+                        $ss = $conn->real_escape_string($s);
+                        $conn->query("INSERT INTO cocktail_steps (cocktail_id, step_order, content) VALUES ($cid_use, $i, '$ss')");
+                    }
+                }
+                header("Location: admin.php?tab=cocktails&sub=cocktails&ck_msg=" . ($cedit ? 'ck_edit' : 'ck_new')); exit;
+            }
+        }
+    }
+
+    // ── 列表加载 ──
+    $ir = $conn->query("SELECT * FROM ingredients ORDER BY type ASC, CONVERT(name USING gbk) ASC");
+    if ($ir) while ($row = $ir->fetch_assoc()) $all_ingredients[] = $row;
+
+    $cr2 = $conn->query("SELECT c.*, COUNT(ci.ingredient_id) AS ing_count FROM cocktails c LEFT JOIN cocktail_ingredients ci ON ci.cocktail_id=c.id GROUP BY c.id ORDER BY CONVERT(c.name USING gbk) ASC");
+    if ($cr2) while ($row = $cr2->fetch_assoc()) $all_cocktails[] = $row;
 }
 
 // ── 装饰系统管理 ──
@@ -850,6 +1094,8 @@ $badge_pending_cs = ($cs_tbl && $cs_tbl->num_rows>0) ? (int)$conn->query("SELECT
         <a href="admin.php?tab=carousel" class="ap-nav-item <?= $tab==='carousel'?'active':'' ?>"><span><span class="ic">🎞</span> 站内活动</span></a>
         <a href="admin.php?tab=decorations" class="ap-nav-item <?= $tab==='decorations'?'active':'' ?>"><span><span class="ic">✨</span> 装饰系统</span></a>
         <a href="admin.php?tab=sheets" class="ap-nav-item <?= $tab==='sheets'?'active':'' ?>"><span><span class="ic">♪</span> 曲库</span></a>
+        <a href="admin.php?tab=cocktails" class="ap-nav-item <?= $tab==='cocktails'?'active':'' ?>"><span><span class="ic">🍸</span> 调酒配方</span></a>
+        <a href="admin.php?tab=sidebar" class="ap-nav-item <?= $tab==='sidebar'?'active':'' ?>"><span><span class="ic">📑</span> 侧边栏</span></a>
 
         <div class="ap-nav-section">用户管理</div>
         <a href="admin.php?tab=reports" class="ap-nav-item <?= $tab==='reports'?'active':'' ?>">
@@ -1990,6 +2236,339 @@ $badge_pending_cs = ($cs_tbl && $cs_tbl->num_rows>0) ? (int)$conn->query("SELECT
     <?php endif; ?>
 
     <!-- ══════════════ TAB: AI 配置 ══════════════ -->
+    <?php elseif ($tab === 'cocktails'): ?>
+
+    <div style="display:flex;gap:8px;margin-bottom:18px;border-bottom:1px solid #21262d;padding-bottom:0;">
+        <a href="admin.php?tab=cocktails&sub=cocktails" style="padding:8px 16px;font-size:13px;text-decoration:none;border-bottom:2px solid <?= $ck_sub==='cocktails'?'#3fb950':'transparent' ?>;color:<?= $ck_sub==='cocktails'?'#3fb950':'#8b949e' ?>;font-family:'Courier New',monospace;">🍸 鸡尾酒（<?= count($all_cocktails) ?>）</a>
+        <a href="admin.php?tab=cocktails&sub=ingredients" style="padding:8px 16px;font-size:13px;text-decoration:none;border-bottom:2px solid <?= $ck_sub==='ingredients'?'#3fb950':'transparent' ?>;color:<?= $ck_sub==='ingredients'?'#3fb950':'#8b949e' ?>;font-family:'Courier New',monospace;">🧂 食材（<?= count($all_ingredients) ?>）</a>
+    </div>
+
+    <?php if ($ck_msg): ?>
+    <div class="msg-bar msg-ok" style="margin-bottom:14px;">
+        <?php
+        $msgs = ['ing_new'=>'✓ 食材已添加','ing_edit'=>'✓ 食材已更新','ing_del'=>'✓ 食材已删除','ing_toggle'=>'✓ 食材状态已切换',
+                 'ck_new'=>'✓ 鸡尾酒已添加','ck_edit'=>'✓ 鸡尾酒已更新','ck_del'=>'✓ 鸡尾酒已删除','ck_toggle'=>'✓ 鸡尾酒状态已切换'];
+        echo $msgs[$ck_msg] ?? '✓ 操作完成';
+        ?>
+    </div>
+    <?php endif; ?>
+    <?php if ($ck_form_err): ?><div class="msg-bar msg-err" style="margin-bottom:14px;">✗ <?= htmlspecialchars($ck_form_err) ?></div><?php endif; ?>
+
+    <?php if ($ck_sub === 'ingredients'):
+        $ck_edit_ing = null;
+        if (isset($_GET['edit_ing']) && is_numeric($_GET['edit_ing'])) {
+            $r = $conn->query("SELECT * FROM ingredients WHERE id=".(int)$_GET['edit_ing']);
+            $ck_edit_ing = ($r && $r->num_rows>0) ? $r->fetch_assoc() : null;
+        }
+    ?>
+    <div style="display:grid;grid-template-columns:320px 1fr;gap:18px;">
+        <!-- 食材表单 -->
+        <div class="ap-card">
+            <div style="padding:10px 14px;border-bottom:1px solid #30363d;font-size:12px;font-weight:700;color:#6e7681;letter-spacing:1.2px;text-transform:uppercase;font-family:'Courier New',monospace;">
+                <?= $ck_edit_ing ? '编辑食材' : '新增食材' ?>
+            </div>
+            <form method="POST" action="admin.php?tab=cocktails&sub=ingredients" style="padding:14px;">
+                <input type="hidden" name="ing_form" value="1">
+                <?php if ($ck_edit_ing): ?><input type="hidden" name="ing_edit_id" value="<?= (int)$ck_edit_ing['id'] ?>"><?php endif; ?>
+                <div style="margin-bottom:10px;">
+                    <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">名称</label>
+                    <input type="text" name="ing_name" value="<?= htmlspecialchars($ck_edit_ing['name'] ?? '') ?>" required maxlength="50"
+                        style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;box-sizing:border-box;">
+                </div>
+                <div style="margin-bottom:10px;">
+                    <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">类型</label>
+                    <select name="ing_type" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;">
+                        <?php foreach ($ingredient_types as $k => $v):
+                            $sel = (($ck_edit_ing['type'] ?? 'other') === $k) ? 'selected' : '';
+                        ?><option value="<?= $k ?>" <?= $sel ?>><?= $v['label'] ?></option><?php endforeach; ?>
+                    </select>
+                </div>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#8b949e;margin-bottom:12px;cursor:pointer;">
+                    <input type="checkbox" name="ing_active" value="1" <?= (!$ck_edit_ing || (int)$ck_edit_ing['is_active']) ? 'checked' : '' ?>> 启用
+                </label>
+                <div style="display:flex;gap:8px;">
+                    <button type="submit" class="btn btn-green"><?= $ck_edit_ing ? '保存' : '添加' ?></button>
+                    <?php if ($ck_edit_ing): ?><a href="admin.php?tab=cocktails&sub=ingredients" class="btn">取消</a><?php endif; ?>
+                </div>
+            </form>
+        </div>
+
+        <!-- 食材列表 -->
+        <div class="ap-card">
+            <script>function adminFilter(i,c){var k=i.value.trim().toLowerCase();document.querySelectorAll('.'+c).forEach(function(e){e.style.display=(!k||(e.dataset.n||'').indexOf(k)>=0)?'':'none';});}</script>
+            <div style="padding:10px 14px;border-bottom:1px solid #30363d;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                <span style="font-size:12px;font-weight:700;color:#6e7681;letter-spacing:1.2px;text-transform:uppercase;font-family:'Courier New',monospace;">食材库（共 <?= count($all_ingredients) ?>）</span>
+                <input type="text" oninput="adminFilter(this,'ai-item')" placeholder="🔍 搜食材" style="width:150px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 10px;border-radius:4px;font-size:12px;outline:none;">
+            </div>
+            <?php if (!$all_ingredients): ?>
+            <div style="padding:30px;text-align:center;color:#6e7681;font-size:13px;">还没有食材，请在左侧添加</div>
+            <?php else: ?>
+            <?php $grouped = []; foreach ($all_ingredients as $ig) $grouped[$ig['type']][] = $ig; ?>
+            <div style="padding:14px;">
+                <?php foreach ($ingredient_types as $tk => $tv):
+                    if (empty($grouped[$tk])) continue; ?>
+                <div style="margin-bottom:14px;">
+                    <div style="font-size:11px;color:<?= $tv['color'] ?>;font-family:'Courier New',monospace;letter-spacing:1px;margin-bottom:6px;text-transform:uppercase;">// <?= $tv['label'] ?></div>
+                    <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                        <?php foreach ($grouped[$tk] as $ig): ?>
+                        <div class="ai-item" data-n="<?= htmlspecialchars(mb_strtolower($ig['name'])) ?>" style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;background:#0d1117;border:1px solid <?= $tv['color'] ?>33;border-radius:14px;font-size:12px;color:<?= (int)$ig['is_active']?'#e6edf3':'#6e7681' ?>;opacity:<?= (int)$ig['is_active']?'1':'.55' ?>;">
+                            <?= htmlspecialchars($ig['name']) ?>
+                            <a href="admin.php?tab=cocktails&sub=ingredients&edit_ing=<?= (int)$ig['id'] ?>" title="编辑" style="color:#58a6ff;text-decoration:none;font-size:11px;">✎</a>
+                            <a href="admin.php?tab=cocktails&sub=ingredients&toggle_ing=<?= (int)$ig['id'] ?>" title="<?= (int)$ig['is_active']?'停用':'启用' ?>" style="color:#d29922;text-decoration:none;font-size:11px;"><?= (int)$ig['is_active']?'◐':'◑' ?></a>
+                            <a href="admin.php?tab=cocktails&sub=ingredients&delete_ing=<?= (int)$ig['id'] ?>" onclick="return confirm('确认删除？关联配方会失去该材料');" title="删除" style="color:#f85149;text-decoration:none;font-size:11px;">✕</a>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <?php else: /* sub=cocktails */ ?>
+
+    <div style="display:grid;grid-template-columns:420px 1fr;gap:18px;">
+        <!-- 鸡尾酒表单 -->
+        <div class="ap-card">
+            <div style="padding:10px 14px;border-bottom:1px solid #30363d;font-size:12px;font-weight:700;color:#6e7681;letter-spacing:1.2px;text-transform:uppercase;font-family:'Courier New',monospace;">
+                <?= $ck_edit_cocktail ? '编辑配方' : '新增配方' ?>
+            </div>
+            <form method="POST" action="admin.php?tab=cocktails&sub=cocktails" enctype="multipart/form-data" style="padding:14px;">
+                <input type="hidden" name="ck_form" value="1">
+                <?php if ($ck_edit_cocktail): ?><input type="hidden" name="ck_edit_id" value="<?= (int)$ck_edit_cocktail['id'] ?>"><?php endif; ?>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                    <div>
+                        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">中文名</label>
+                        <input type="text" name="ck_name" required maxlength="80" value="<?= htmlspecialchars($ck_edit_cocktail['name'] ?? '') ?>"
+                            style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;box-sizing:border-box;">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">英文名</label>
+                        <input type="text" name="ck_name_en" maxlength="80" value="<?= htmlspecialchars($ck_edit_cocktail['name_en'] ?? '') ?>"
+                            style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;box-sizing:border-box;">
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                    <div>
+                        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">酒杯</label>
+                        <?php
+                        $g_cur = $ck_edit_cocktail['glass'] ?? '';
+                        preg_match('/^(.*?)[（(]?\s*([\d.]+)\s*ml[）)]?\s*$/u', $g_cur, $gm);
+                        $g_cur_type = $gm ? trim($gm[1]) : $g_cur;
+                        $g_cur_ml   = $gm[2] ?? '';
+                        $GLASS_TYPES = ['马天尼杯','古典杯','岩石杯','高球杯','柯林杯','香槟杯','葡萄酒杯','烈酒杯','子弹杯','飓风杯','玛格丽特杯','铜杯','库佩杯','海波杯','宴球杯','果汁杯','热饮杯'];
+                        $ist = "background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;box-sizing:border-box;";
+                        ?>
+                        <div style="display:flex;gap:6px;align-items:center;">
+                            <select name="ck_glass_type" style="flex:1;<?= $ist ?>">
+                                <option value="">选杯型</option>
+                                <?php foreach ($GLASS_TYPES as $gt): ?><option<?= $gt===$g_cur_type?' selected':'' ?>><?= $gt ?></option><?php endforeach; ?>
+                                <?php if ($g_cur_type !== '' && !in_array($g_cur_type, $GLASS_TYPES, true)): ?><option selected><?= htmlspecialchars($g_cur_type) ?></option><?php endif; ?>
+                            </select>
+                            <input type="text" name="ck_glass_ml" inputmode="decimal" placeholder="容量" value="<?= htmlspecialchars($g_cur_ml) ?>" style="width:64px;<?= $ist ?>">
+                            <span style="color:#8b949e;font-size:12px;">ml</span>
+                        </div>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">调法</label>
+                        <select name="ck_method" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;">
+                            <?php foreach ($cocktail_methods_map as $mk => $mv):
+                                $sel = (($ck_edit_cocktail['method'] ?? 'shake') === $mk) ? 'selected' : '';
+                            ?><option value="<?= $mk ?>" <?= $sel ?>><?= $mv ?></option><?php endforeach; ?>
+                        </select>
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                    <div>
+                        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">装饰</label>
+                        <input type="text" name="ck_garnish" maxlength="120" placeholder="例：柠檬皮" value="<?= htmlspecialchars($ck_edit_cocktail['garnish'] ?? '') ?>"
+                            style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;box-sizing:border-box;">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">酒精度</label>
+                        <?php
+                        $a_cur = $ck_edit_cocktail['abv_hint'] ?? '';
+                        preg_match('/^(\D*?)\s*([\d.]+)\s*%?\s*$/u', $a_cur, $am);
+                        $a_cur_preset = $am ? trim($am[1]) : $a_cur;
+                        $a_cur_num    = $am[2] ?? '';
+                        $ABV_PRESETS = ['无酒精','低度','低到中度','中度','中到高度','高度'];
+                        ?>
+                        <div style="display:flex;gap:6px;align-items:center;">
+                            <select name="ck_abv_preset" style="flex:1;<?= $ist ?? 'background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;box-sizing:border-box;' ?>">
+                                <option value="">选度数</option>
+                                <?php foreach ($ABV_PRESETS as $ap): ?><option<?= $ap===$a_cur_preset?' selected':'' ?>><?= $ap ?></option><?php endforeach; ?>
+                                <?php if ($a_cur_preset !== '' && !in_array($a_cur_preset, $ABV_PRESETS, true)): ?><option selected><?= htmlspecialchars($a_cur_preset) ?></option><?php endif; ?>
+                            </select>
+                            <input type="text" name="ck_abv_num" inputmode="decimal" placeholder="数值" value="<?= htmlspecialchars($a_cur_num) ?>" style="width:56px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;border-radius:4px;font-size:13px;outline:none;box-sizing:border-box;">
+                            <span style="color:#8b949e;font-size:12px;">%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom:10px;">
+                    <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:5px;font-family:'Courier New',monospace;">图片（≤5MB，可选）</label>
+                    <input type="file" name="ck_image" accept="image/*" onchange="prevCk(this)" style="font-size:12px;color:#8b949e;width:100%;">
+                    <img id="ck-preview" src="<?= !empty($ck_edit_cocktail['image']) ? '../'.htmlspecialchars($ck_edit_cocktail['image']) : '' ?>"
+                         style="<?= !empty($ck_edit_cocktail['image']) ? '' : 'display:none;' ?>max-width:100%;margin-top:8px;border-radius:4px;border:1px solid #30363d;">
+                </div>
+
+                <!-- 配方材料 -->
+                <div style="margin-bottom:10px;border:1px dashed #30363d;border-radius:4px;padding:10px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <span style="font-size:11px;color:#8b949e;font-family:'Courier New',monospace;letter-spacing:.8px;">// 所需材料</span>
+                        <button type="button" onclick="ckAddIng()" class="btn btn-green" style="padding:3px 10px;font-size:11px;">+ 添加</button>
+                    </div>
+                    <div id="ck-ing-rows"></div>
+                </div>
+
+                <!-- 调制步骤（多步） -->
+                <div style="margin-bottom:10px;border:1px dashed #30363d;border-radius:4px;padding:10px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <span style="font-size:11px;color:#8b949e;font-family:'Courier New',monospace;letter-spacing:.8px;">// 调制步骤</span>
+                        <button type="button" onclick="ckAddStep()" class="btn btn-green" style="padding:3px 10px;font-size:11px;">+ 添加步骤</button>
+                    </div>
+                    <div id="ck-step-rows"></div>
+                </div>
+
+                <div style="margin-bottom:12px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#8b949e;cursor:pointer;">
+                        <input type="checkbox" name="ck_active" value="1" <?= (!$ck_edit_cocktail || (int)$ck_edit_cocktail['is_active']) ? 'checked' : '' ?>> 启用（在调酒页可见）
+                    </label>
+                </div>
+
+                <div style="display:flex;gap:8px;">
+                    <button type="submit" class="btn btn-green"><?= $ck_edit_cocktail ? '保存' : '添加' ?></button>
+                    <?php if ($ck_edit_cocktail): ?><a href="admin.php?tab=cocktails&sub=cocktails" class="btn">取消</a><?php endif; ?>
+                </div>
+            </form>
+        </div>
+
+        <!-- 鸡尾酒列表 -->
+        <div class="ap-card">
+            <div style="padding:10px 14px;border-bottom:1px solid #30363d;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                <span style="font-size:12px;font-weight:700;color:#6e7681;letter-spacing:1.2px;text-transform:uppercase;font-family:'Courier New',monospace;">配方库（共 <?= count($all_cocktails) ?>）</span>
+                <input type="text" oninput="adminFilter(this,'ac-item')" placeholder="🔍 搜配方（中/英文）" style="width:190px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:5px 10px;border-radius:4px;font-size:12px;outline:none;">
+            </div>
+            <?php if (!$all_cocktails): ?>
+            <div style="padding:30px;text-align:center;color:#6e7681;font-size:13px;">还没有鸡尾酒，请在左侧添加</div>
+            <?php else: ?>
+            <div style="padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;">
+                <?php foreach ($all_cocktails as $ck): ?>
+                <div class="ac-item" data-n="<?= htmlspecialchars(mb_strtolower($ck['name'].' '.($ck['name_en']??''))) ?>" style="background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:hidden;opacity:<?= (int)$ck['is_active']?'1':'.55' ?>;">
+                    <?php if (!empty($ck['image'])): ?>
+                    <img src="../<?= htmlspecialchars($ck['image']) ?>" style="width:100%;height:120px;object-fit:cover;display:block;">
+                    <?php else: ?>
+                    <div style="width:100%;height:120px;background:linear-gradient(135deg,#21262d,#161b22);display:flex;align-items:center;justify-content:center;font-size:32px;color:#30363d;">🍸</div>
+                    <?php endif; ?>
+                    <div style="padding:10px;">
+                        <div style="font-size:13px;font-weight:700;color:#e6edf3;margin-bottom:2px;"><?= htmlspecialchars($ck['name']) ?></div>
+                        <div style="font-size:10px;color:#6e7681;font-family:'Courier New',monospace;margin-bottom:6px;"><?= htmlspecialchars($ck['name_en'] ?: '—') ?> · <?= (int)$ck['ing_count'] ?> 材料</div>
+                        <div style="display:flex;gap:6px;font-size:11px;">
+                            <a href="admin.php?tab=cocktails&sub=cocktails&edit_ck=<?= (int)$ck['id'] ?>" style="color:#58a6ff;text-decoration:none;">✎ 编辑</a>
+                            <a href="admin.php?tab=cocktails&sub=cocktails&toggle_ck=<?= (int)$ck['id'] ?>" style="color:#d29922;text-decoration:none;"><?= (int)$ck['is_active']?'◐ 隐藏':'◑ 启用' ?></a>
+                            <a href="admin.php?tab=cocktails&sub=cocktails&delete_ck=<?= (int)$ck['id'] ?>" onclick="return confirm('确认删除「<?= htmlspecialchars($ck['name'], ENT_QUOTES) ?>」？');" style="color:#f85149;text-decoration:none;">✕ 删除</a>
+                        </div>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <script>
+    // 食材列表（用于材料行下拉）
+    const _allIngs = <?= json_encode(array_map(function($i) use ($ingredient_types){
+        return ['id'=>(int)$i['id'],'name'=>$i['name'],'type'=>$i['type'],'label'=>$ingredient_types[$i['type']]['label'] ?? '其他'];
+    }, $all_ingredients), JSON_UNESCAPED_UNICODE) ?>;
+    const _editIngs = <?= json_encode($ck_edit_cocktail ? ($ck_edit_cocktail['ings'] ?? []) : [], JSON_UNESCAPED_UNICODE) ?>;
+    const _editSteps = <?= json_encode($ck_edit_cocktail ? ($ck_edit_cocktail['steps'] ?? []) : [], JSON_UNESCAPED_UNICODE) ?>;
+    function ckBuildIngOptions(selectedId){
+        let html = '<option value="">— 选择食材 —</option>';
+        // 按类型分组
+        const groups = {};
+        _allIngs.forEach(ig => { (groups[ig.label] = groups[ig.label] || []).push(ig); });
+        Object.keys(groups).forEach(label => {
+            html += '<optgroup label="'+label+'">';
+            groups[label].forEach(ig => {
+                html += '<option value="'+ig.id+'"'+(parseInt(selectedId)===ig.id?' selected':'')+'>'+ig.name+'</option>';
+            });
+            html += '</optgroup>';
+        });
+        return html;
+    }
+    const CK_UNITS = ['ml','cl','oz','块','片','滴','个','茶匙','吧匙','满杯','适量','少许','dash'];
+    function ckUnitOptions(sel){
+        let h = '<option value="">单位</option>';
+        CK_UNITS.forEach(u => h += `<option value="${u}"${u===sel?' selected':''}>${u}</option>`);
+        if (sel && !CK_UNITS.includes(sel)) h += `<option value="${sel}" selected>${sel}</option>`;
+        return h;
+    }
+    function ckAddIng(selId, amount){
+        const wrap = document.getElementById('ck-ing-rows');
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:6px;margin-bottom:6px;';
+        const m = String(amount||'').match(/^\s*([\d.]*)\s*(.*?)\s*$/);
+        const num = m ? m[1] : '', unit = m ? m[2] : '';
+        row.innerHTML = `
+            <select name="ck_ing_id[]" style="flex:1;min-width:0;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:12px;outline:none;">${ckBuildIngOptions(selId)}</select>
+            <input type="text" name="ck_ing_num[]" inputmode="decimal" placeholder="量" value="${num.replace(/"/g,'&quot;')}" style="width:56px;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:12px;outline:none;">
+            <select name="ck_ing_unit[]" style="width:84px;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:5px 6px;border-radius:4px;font-size:12px;outline:none;">${ckUnitOptions(unit)}</select>
+            <button type="button" onclick="this.parentElement.remove()" style="background:transparent;border:1px solid #30363d;color:#f85149;padding:0 8px;border-radius:4px;cursor:pointer;font-size:12px;">✕</button>
+        `;
+        wrap.appendChild(row);
+    }
+    // 步骤行（自动增高 textarea）
+    function ckEsc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function ckAutoGrow(el){ el.style.height='auto'; el.style.height=(el.scrollHeight+2)+'px'; }
+    function ckAddStep(content){
+        const wrap = document.getElementById('ck-step-rows');
+        const row = document.createElement('div');
+        row.className = 'ck-step-row';
+        row.style.cssText = 'display:flex;gap:6px;margin-bottom:6px;align-items:flex-start;';
+        const idx = wrap.children.length + 1;
+        row.innerHTML = `
+            <span class="ck-step-num" style="width:22px;text-align:center;color:#3fb950;font-family:'Courier New',monospace;font-size:12px;flex-shrink:0;padding-top:7px;">${idx}.</span>
+            <textarea name="ck_step[]" maxlength="500" rows="1" oninput="ckAutoGrow(this)" placeholder="例：杯中放入薄荷叶与糖，轻捣释香" style="flex:1;min-width:0;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:6px 8px;border-radius:4px;font-size:12px;outline:none;resize:none;overflow:hidden;line-height:1.5;font-family:inherit;">${ckEsc(content)}</textarea>
+            <button type="button" onclick="ckRemoveStep(this)" style="background:transparent;border:1px solid #30363d;color:#f85149;padding:0 8px;border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0;margin-top:3px;">✕</button>
+        `;
+        wrap.appendChild(row);
+        const ta = row.querySelector('textarea'); if (ta) ckAutoGrow(ta);
+    }
+    function ckRemoveStep(btn){
+        btn.parentElement.remove();
+        ckRenumberSteps();
+    }
+    function ckRenumberSteps(){
+        document.querySelectorAll('#ck-step-rows .ck-step-row .ck-step-num').forEach((el,i)=>{ el.textContent = (i+1) + '.'; });
+    }
+
+    // 编辑时回填
+    if (_editIngs.length) {
+        _editIngs.forEach(r => ckAddIng(r.ingredient_id, r.amount));
+    } else {
+        ckAddIng();
+    }
+    if (_editSteps.length) {
+        _editSteps.forEach(s => ckAddStep(s));
+    } else {
+        ckAddStep();
+    }
+    function prevCk(input){
+        const p=document.getElementById('ck-preview');
+        if(input.files&&input.files[0]){
+            const r=new FileReader(); r.onload=ev=>{p.src=ev.target.result;p.style.display='block';};
+            r.readAsDataURL(input.files[0]);
+        }
+    }
+    </script>
+
+    <?php endif; /* end sub */ ?>
+
     <?php elseif ($tab === 'ai'):
         $ds_url   = get_setting($conn, 'deepseek_base_url', 'https://api.deepseek.com');
         $ds_model = get_setting($conn, 'deepseek_model',    'deepseek-chat');
@@ -1997,6 +2576,7 @@ $badge_pending_cs = ($cs_tbl && $cs_tbl->num_rows>0) ? (int)$conn->query("SELECT
     ?>
 
     <?php if ($ai_msg === 'saved'): ?><div class="msg-bar msg-ok">✓ AI 配置已保存</div><?php endif; ?>
+    <?php if ($ai_msg === 'owcn_saved'): ?><div class="msg-bar msg-ok">✓ 守望国服凭证已保存</div><?php endif; ?>
 
     <div class="ap-card" style="margin-bottom:18px;">
         <div style="padding:12px 16px;border-bottom:1px solid #30363d;font-size:12px;font-weight:700;color:#6e7681;letter-spacing:1.2px;text-transform:uppercase;font-family:'Courier New',monospace;">
@@ -2041,6 +2621,143 @@ $badge_pending_cs = ($cs_tbl && $cs_tbl->num_rows>0) ? (int)$conn->query("SELECT
             </form>
         </div>
     </div>
+
+    <?php
+        $ow_tok  = get_setting($conn, 'ow_ds163_token',   '');
+        $ow_role = get_setting($conn, 'ow_ds163_roleid',  '');
+        $ow_uid  = get_setting($conn, 'ow_ds163_uid',     '');
+        $ow_dev  = get_setting($conn, 'ow_ds163_deviceid','');
+        $ow_xsrf = get_setting($conn, 'ow_ds163_xsrf',    '');
+        $ow_sess = get_setting($conn, 'ow_ds163_ntes_sess','');
+        $ow_dts  = get_setting($conn, 'ow_ds163_dts',     '2026');
+        $ow_srv  = get_setting($conn, 'ow_ds163_server',  '1');
+        $owIst   = "width:100%;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:8px 10px;border-radius:4px;font-size:13px;font-family:'Courier New',monospace;outline:none;box-sizing:border-box;";
+        $owLst   = "display:block;font-size:11px;color:#8b949e;font-family:'Courier New',monospace;letter-spacing:.5px;margin-bottom:6px;";
+    ?>
+    <div class="ap-card" style="margin-bottom:18px;">
+        <div style="padding:12px 16px;border-bottom:1px solid #30363d;font-size:12px;font-weight:700;color:#6e7681;letter-spacing:1.2px;text-transform:uppercase;font-family:'Courier New',monospace;">
+            守望先锋国服（网易大神）
+        </div>
+        <div style="padding:18px;">
+            <p style="margin:0 0 14px;color:#8b949e;font-size:12px;line-height:1.7;font-family:'Courier New',monospace;">
+                ⓘ 用于 <a href="../pages/ow_analyzer.php" style="color:#58a6ff;">国服战绩查询</a>（直连 datamsapi.ds.163.com）。这是一份“服务账号”登录态，配一次即可查任意人。<br>
+                ⓘ 抓法：浏览器登录 <code style="color:#e3b341;">act.ds.163.com/f0834ac50394246e</code> → F12 Network 找 <code style="color:#e3b341;">datamsapi.ds.163.com</code> 的请求 → 复制请求头里的 <code style="color:#e3b341;">gl-bigdata-auth-token</code>(=token)、<code style="color:#e3b341;">gl-bigdata-role-id</code>(=roleId)、<code style="color:#e3b341;">gl-uid</code>、<code style="color:#e3b341;">gl-deviceid</code>、<code style="color:#e3b341;">gl-x-xsrf-token</code>。<br>
+                ⚠ token 会过期，过期后重新抓一份覆盖即可。
+            </p>
+            <form method="POST" action="admin.php?tab=ai">
+                <input type="hidden" name="save_owcn" value="1">
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="<?= $owLst ?>">token（登录态）
+                        <?php if ($ow_tok !== ''): ?><span style="color:#3fb950;">（当前：<?= htmlspecialchars(mask_secret($ow_tok)) ?>）</span>
+                        <?php else: ?><span style="color:#f0883e;">（未配置）</span><?php endif; ?>
+                    </label>
+                    <input type="password" name="ow_ds163_token" value="" placeholder="<?= $ow_tok !== '' ? '留空则不修改' : 'd94e563...' ?>" autocomplete="off" style="<?= $owIst ?>">
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="<?= $owLst ?>">roleId</label>
+                    <input type="text" name="ow_ds163_roleid" value="<?= htmlspecialchars($ow_role) ?>" placeholder="672951967" style="<?= $owIst ?>">
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="<?= $owLst ?>">gl-uid（GOD_UUID）</label>
+                    <input type="text" name="ow_ds163_uid" value="<?= htmlspecialchars($ow_uid) ?>" style="<?= $owIst ?>">
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="<?= $owLst ?>">gl-deviceid</label>
+                    <input type="text" name="ow_ds163_deviceid" value="<?= htmlspecialchars($ow_dev) ?>" style="<?= $owIst ?>">
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="<?= $owLst ?>">gl-x-xsrf-token</label>
+                    <input type="text" name="ow_ds163_xsrf" value="<?= htmlspecialchars($ow_xsrf) ?>" style="<?= $owIst ?>">
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="<?= $owLst ?>">NTES_YD_SESS（查别人必需，会过期需跟着更新）</label>
+                    <textarea name="ow_ds163_ntes_sess" rows="2" style="<?= $owIst ?>resize:vertical;word-break:break-all;"><?= htmlspecialchars($ow_sess) ?></textarea>
+                </div>
+                <div style="display:flex;gap:10px;">
+                    <div class="form-group" style="margin-bottom:14px;flex:1;">
+                        <label style="<?= $owLst ?>">dts</label>
+                        <input type="text" name="ow_ds163_dts" value="<?= htmlspecialchars($ow_dts) ?>" placeholder="2026" style="<?= $owIst ?>">
+                    </div>
+                    <div class="form-group" style="margin-bottom:14px;flex:1;">
+                        <label style="<?= $owLst ?>">server</label>
+                        <input type="text" name="ow_ds163_server" value="<?= htmlspecialchars($ow_srv) ?>" placeholder="1" style="<?= $owIst ?>">
+                    </div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <button type="submit" class="btn btn-green">保存凭证</button>
+                    <?php if ($ow_tok !== ''): ?>
+                    <button type="submit" name="ow_clear_token" value="1" class="btn btn-danger" onclick="return confirm('确认清空 token？');">清空 token</button>
+                    <?php endif; ?>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <?php elseif ($tab === 'sidebar'):
+        $sb_groups = get_sidebar($conn);
+        $sbI = "background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:7px 9px;border-radius:4px;font-size:13px;font-family:'Courier New',monospace;outline:none;box-sizing:border-box;";
+    ?>
+    <?php if (($_GET['sb_msg'] ?? '') === 'ok'): ?><div class="msg-bar msg-ok">✓ 侧边栏已更新</div><?php endif; ?>
+
+    <div class="ap-card" style="margin-bottom:18px;">
+        <div style="padding:12px 16px;border-bottom:1px solid #30363d;font-size:12px;font-weight:700;color:#6e7681;letter-spacing:1.2px;text-transform:uppercase;font-family:'Courier New',monospace;">新增分类</div>
+        <div style="padding:16px;">
+            <p style="margin:0 0 12px;color:#8b949e;font-size:12px;line-height:1.7;font-family:'Courier New',monospace;">ⓘ 管理网站左上角 ☰ 展开的侧边栏。分类下挂若干快捷入口。<br>ⓘ 链接填站内相对路径，如 <code style="color:#e3b341;">bartender.php</code> 或 <code style="color:#e3b341;">pages/ow_analyzer.php</code>（自动适配子目录）。图标填 1 个 emoji/字符。</p>
+            <form method="POST" action="admin.php?tab=sidebar" style="display:flex;gap:8px;">
+                <input type="hidden" name="sb_action" value="add_group">
+                <input type="text" name="gname" maxlength="50" placeholder="分类名，如：社区" required style="<?= $sbI ?>flex:1;">
+                <button type="submit" class="btn btn-green">+ 加分类</button>
+            </form>
+        </div>
+    </div>
+
+    <?php foreach ($sb_groups as $g): ?>
+    <div class="ap-card" style="margin-bottom:14px;">
+        <div style="padding:10px 14px;border-bottom:1px solid #30363d;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <form method="POST" action="admin.php?tab=sidebar" style="display:flex;gap:6px;align-items:center;flex:1;min-width:200px;">
+                <input type="hidden" name="sb_action" value="rename_group">
+                <input type="hidden" name="gid" value="<?= (int)$g['id'] ?>">
+                <input type="text" name="gname" value="<?= htmlspecialchars($g['name']) ?>" maxlength="50" style="<?= $sbI ?>font-weight:700;flex:1;">
+                <button type="submit" class="btn" style="font-size:12px;">改名</button>
+            </form>
+            <form method="POST" action="admin.php?tab=sidebar" onsubmit="return confirm('删除分类「<?= htmlspecialchars($g['name']) ?>」及其下所有链接？');">
+                <input type="hidden" name="sb_action" value="del_group">
+                <input type="hidden" name="gid" value="<?= (int)$g['id'] ?>">
+                <button type="submit" class="btn btn-danger" style="font-size:12px;">删分类</button>
+            </form>
+        </div>
+        <div style="padding:12px 14px;">
+            <?php if (empty($g['links'])): ?>
+                <p style="margin:0 0 10px;color:#6e7681;font-size:12px;">（暂无链接）</p>
+            <?php else: ?>
+            <table style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+                <?php foreach ($g['links'] as $l): ?>
+                <tr style="border-bottom:1px solid #21262d;">
+                    <td style="padding:6px 8px;width:30px;text-align:center;font-size:15px;"><?= htmlspecialchars($l['icon']) ?></td>
+                    <td style="padding:6px 8px;color:#e6edf3;font-size:13px;"><?= htmlspecialchars($l['label']) ?></td>
+                    <td style="padding:6px 8px;color:#8b949e;font-size:12px;font-family:'Courier New',monospace;word-break:break-all;"><?= htmlspecialchars($l['url']) ?></td>
+                    <td style="padding:6px 8px;width:46px;text-align:right;">
+                        <form method="POST" action="admin.php?tab=sidebar" onsubmit="return confirm('删除链接「<?= htmlspecialchars($l['label']) ?>」？');">
+                            <input type="hidden" name="sb_action" value="del_link">
+                            <input type="hidden" name="lid" value="<?= (int)$l['id'] ?>">
+                            <button type="submit" class="btn btn-danger" style="font-size:11px;padding:2px 8px;">删</button>
+                        </form>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </table>
+            <?php endif; ?>
+            <form method="POST" action="admin.php?tab=sidebar" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+                <input type="hidden" name="sb_action" value="add_link">
+                <input type="hidden" name="gid" value="<?= (int)$g['id'] ?>">
+                <input type="text" name="icon"  maxlength="10" placeholder="🍸" style="<?= $sbI ?>width:50px;text-align:center;">
+                <input type="text" name="label" maxlength="50" placeholder="名称" required style="<?= $sbI ?>width:120px;">
+                <input type="text" name="url"   maxlength="255" placeholder="路径，如 bartender.php" required style="<?= $sbI ?>flex:1;min-width:160px;">
+                <button type="submit" class="btn btn-green" style="font-size:12px;">+ 加链接</button>
+            </form>
+        </div>
+    </div>
+    <?php endforeach; ?>
 
     <?php endif; /* end tab switch */ ?>
 
